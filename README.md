@@ -46,6 +46,44 @@ npm --prefix apps/desktop install
 npm --prefix apps/desktop run build
 ```
 
+### Windows PowerShell
+
+Install these prerequisites first:
+
+- Rust stable with the `x86_64-pc-windows-msvc` toolchain;
+- Visual Studio Build Tools with **Desktop development with C++** and a
+  Windows 10/11 SDK;
+- Node.js 20+;
+- WebView2 Runtime;
+- FFmpeg on `PATH` for the CLI/media validation.
+
+From the repository root:
+
+```powershell
+npm --prefix apps/desktop install
+cargo check --workspace
+npm --prefix apps/desktop run desktop
+```
+
+`desktop` starts the Vite frontend and opens the Tauri window. The frontend
+build alone (`npm --prefix apps/desktop run build`) does not launch the desktop
+application. To produce a Windows bundle, use:
+
+```powershell
+npm --prefix apps/desktop run desktop:build
+```
+
+For the media validation gate without GNU Make:
+
+```powershell
+cargo run --quiet -p courage-cli -- demo `
+  --output target/validation/courage-demo.mp4 `
+  --seconds 4 --replay-seconds 4
+```
+
+The Windows resource icon must exist at
+`apps/desktop/src-tauri/icons/icon.ico` before running a Tauri build.
+
 The one-command media gate is:
 
 ```bash
