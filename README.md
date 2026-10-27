@@ -13,18 +13,19 @@ The repository is being built in dependency order. The first vertical slice is
 implemented and verified:
 
 - bounded, byte-aware rolling video buffer;
-- deterministic capture source for repeatable development and CI;
-- non-blocking snapshot/export boundary;
-- FFmpeg MP4 export with H.264 video and optional synthetic AAC audio;
+- FFmpeg-backed rolling desktop capture split into bounded one-second segments;
+- non-blocking replay save boundary that never pauses the capture process;
+- local MP4 export with microphone audio through the platform's default audio device;
 - basic local trim/export command that produces a second playable MP4;
 - SQLite clip metadata store;
 - Tauri 2 / React / TypeScript desktop shell with the product surface and
   explicit browser-preview state.
 
-Native screen/window/audio capture is intentionally behind interfaces and is
-not marked complete until it has been tested on each target operating system.
-See the project documentation and development scripts for verification steps
-and known limitations.
+The desktop runtime now uses FFmpeg native input backends: Windows `gdigrab`
+plus WASAPI, macOS `avfoundation`, and Linux X11 plus PulseAudio. Wayland
+PipeWire capture and per-GPU hardware encoder selection still require host
+verification. The voice phrase uses the WebView speech-recognition API and
+requires microphone permission.
 
 ## Quick start
 
@@ -44,6 +45,7 @@ ffprobe -v error -show_entries format=duration:stream=codec_name,codec_type \
   -of default=noprint_wrappers=1 target/courage-demo.mp4
 npm --prefix apps/desktop install
 npm --prefix apps/desktop run build
+npm --prefix apps/desktop run desktop
 ```
 
 ### Windows PowerShell
@@ -83,6 +85,23 @@ cargo run --quiet -p courage-cli -- demo `
 
 The Windows resource icon must exist at
 `apps/desktop/src-tauri/icons/icon.ico` before running a Tauri build.
+
+### Recording a real clip
+
+1. Start the desktop app with `npm --prefix apps/desktop run desktop`.
+2. Allow display and microphone access when Windows/WebView2 asks.
+3. Leave the replay buffer running while you play.
+4. Say **“Courage, have it”** or press **Save last 30s**.
+5. Open the Library and click the saved clip to play it.
+
+Clips and the SQLite library are stored under the Tauri app-local data
+directory, not in the repository and not as demo files. On Windows this is
+normally `%LOCALAPPDATA%\dev.courage.recorder\`.
+
+If the default microphone is not the device you want, set
+`COURAGE_AUDIO_DEVICE` before launching the app. FFmpeg's WASAPI device name
+must be used. The status line will report a capture startup error instead of
+claiming that recording is active when FFmpeg exits.
 
 The one-command media gate is:
 

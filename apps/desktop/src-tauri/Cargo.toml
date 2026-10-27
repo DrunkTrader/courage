@@ -15,6 +15,7 @@ tauri-build = { version = "2.4", features = [] }
 
 [dependencies]
 courage-core = { path = "../../../crates/courage-core" }
+courage-store = { path = "../../../crates/courage-store" }
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "2.8", features = [] }
+tauri = { version = "2.8", features = ["protocol-asset"] }
 thiserror = "2"
