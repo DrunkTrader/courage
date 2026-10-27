@@ -1,0 +1,14 @@
+/target/
+/node_modules/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+audit/

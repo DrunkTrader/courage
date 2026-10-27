@@ -1,0 +1,10 @@
+[package]
+name = "courage-store"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Local SQLite metadata store for Courage media"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"

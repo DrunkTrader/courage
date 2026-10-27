@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/courage-core",
+    "crates/courage-store",
+    "crates/courage-cli",
+    "apps/desktop/src-tauri",
+]
+resolver = "2"
