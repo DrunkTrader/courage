@@ -7,7 +7,6 @@
     "core:default",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
-    "dialog:default",
-    "notification:default"
+    "dialog:default"
   ]
 }

@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
-use tauri_plugin_notification::NotificationExt;
 
 const DEFAULT_REPLAY_SECONDS: u64 = 30;
 const CAPTURE_FPS: u32 = 30;
@@ -725,12 +724,19 @@ fn to_response(record: ClipRecord) -> ClipResponse {
 }
 
 fn notify_clip_saved(app: &AppHandle, clip: &ClipResponse, trigger: &str) {
-    let _ = app
-        .notification()
-        .builder()
-        .title("Courage · clip saved")
-        .body(format!("{trigger} · {}", clip.path))
-        .show();
+    #[cfg(windows)]
+    {
+        use tauri_winrt_notification::{Duration as ToastDuration, Toast};
+
+        let _ = Toast::new(Toast::POWERSHELL_APP_ID)
+            .title("Courage · clip saved")
+            .text1(trigger)
+            .text2(&clip.path)
+            .duration(ToastDuration::Short)
+            .show();
+    }
+    #[cfg(not(windows))]
+    let _ = (app, trigger, clip);
     let _ = app.emit("clip-saved", clip);
 }
 
@@ -865,7 +871,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir().map_err(|error| error.to_string())?;
             let state = AppState::new(data_dir)
