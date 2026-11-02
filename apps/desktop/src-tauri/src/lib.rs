@@ -1,37 +1,49 @@
 use std::fs;
-use std::io::{self, Read};
-#[cfg(windows)]
-use std::io::{BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod capture;
+mod process;
+mod voice;
 #[cfg(windows)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+mod windows_process;
+use capture::{CaptureProcess, CaptureState};
+use process::ManagedChild;
+use voice::{
+    Diagnostics as VoiceDiagnostics, Matcher, RecognitionResult, SpeechEvent, VoiceConfig,
+};
 
 use courage_store::{ClipRecord, ClipStore};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 const DEFAULT_REPLAY_SECONDS: u64 = 30;
 const DEFAULT_HOTKEY: &str = "CommandOrControl+Shift+1";
 const DEFAULT_WAKE_PHRASE: &str = "Courage";
 const DEFAULT_COMMAND_PHRASE: &str = "have it";
-#[cfg(windows)]
-const VOICE_COOLDOWN: Duration = Duration::from_secs(2);
-#[cfg(windows)]
-const VOICE_CONFIDENCE_THRESHOLD: f32 = 0.72;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
-    pub state: String,
+    pub revision: u64,
+    pub state: CaptureState,
+    pub session_id: Option<String>,
+    pub pid: Option<u32>,
+    pub session_directory: Option<String>,
+    pub error: Option<String>,
     pub platform: String,
     pub backend: String,
     pub audio_device: Option<String>,
     pub voice_trigger: String,
+    pub voice: VoiceDiagnostics,
     pub output_dir: String,
     pub replay_seconds: u64,
     pub fps: u32,
@@ -61,22 +73,6 @@ pub struct AudioDevice {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VoiceTestResponse {
-    pub normalized: String,
-    pub wake_matched: bool,
-    pub command_matched: bool,
-    pub would_trigger: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceRecognitionResult {
-    pub phrase: String,
-    pub confidence: f32,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SettingsResponse {
     pub output_dir: String,
     pub default_output_dir: String,
@@ -101,6 +97,7 @@ pub struct SettingsResponse {
     pub voice_wake_phrase: String,
     pub voice_command_phrase: String,
     pub voice_wake_only: bool,
+    pub voice_locale: String,
     pub theme: String,
 }
 
@@ -127,6 +124,7 @@ pub struct SettingsInput {
     pub voice_wake_phrase: String,
     pub voice_command_phrase: String,
     pub voice_wake_only: bool,
+    pub voice_locale: String,
     pub theme: String,
 }
 
@@ -153,6 +151,7 @@ struct SettingsFile {
     voice_wake_phrase: String,
     voice_command_phrase: String,
     voice_wake_only: bool,
+    voice_locale: String,
     theme: String,
 }
 
@@ -179,26 +178,29 @@ impl Default for SettingsFile {
             voice_wake_phrase: DEFAULT_WAKE_PHRASE.to_owned(),
             voice_command_phrase: DEFAULT_COMMAND_PHRASE.to_owned(),
             voice_wake_only: false,
+            voice_locale: "en-US".into(),
             theme: "dark".to_owned(),
         }
     }
 }
 
+// ponytail: one mutex serializes bounded process/file work. Slow storage can still
+// delay status; move library I/O to a separate owner if measurements require it.
 struct AppState {
     data_dir: PathBuf,
     default_output_dir: PathBuf,
     settings_path: PathBuf,
     settings: SettingsFile,
     store: ClipStore,
+    control: Arc<Control>,
+    error: Option<String>,
     capture: Option<CaptureSession>,
     voice: Option<VoiceSession>,
-    #[cfg(windows)]
-    last_voice_save: Option<Instant>,
+    voice_diagnostics: VoiceDiagnostics,
 }
 
 struct CaptureSession {
-    process: Child,
-    segments_dir: PathBuf,
+    owner: CaptureProcess,
     backend: String,
     audio_enabled: bool,
     encoder: String,
@@ -207,7 +209,78 @@ struct CaptureSession {
 }
 
 struct VoiceSession {
-    process: Child,
+    process: ManagedChild,
+    config: VoiceConfig,
+    generation: String,
+    capture_session: Option<String>,
+    test_mode: bool,
+    matcher: Matcher,
+    deadline: Instant,
+    ready: bool,
+    test_until: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Control {
+    revision: AtomicU64,
+    stop_epoch: AtomicU64,
+    exiting: AtomicBool,
+    exit_complete: AtomicBool,
+    stop_requested: AtomicBool,
+    operation: AtomicBool,
+    stops: AtomicUsize,
+}
+
+impl Control {
+    fn prepare_start(&self, requested_epoch: u64) -> Result<(), String> {
+        let cancelled = || {
+            self.exiting.load(Ordering::Acquire)
+                || self.stops.load(Ordering::Acquire) > 0
+                || self.stop_epoch.load(Ordering::Acquire) != requested_epoch
+        };
+        if cancelled() {
+            return Err("Start cancelled by a later stop/exit".into());
+        }
+        self.stop_requested.store(false, Ordering::Release);
+        // Stop can arrive while we clear the previous session's cancellation flag.
+        if cancelled() {
+            self.stop_requested.store(true, Ordering::Release);
+            return Err("Start cancelled by a later stop/exit".into());
+        }
+        Ok(())
+    }
+}
+
+struct Operation(Arc<Control>);
+impl Operation {
+    fn acquire(control: &Arc<Control>) -> Result<Self, String> {
+        if control.exiting.load(Ordering::Acquire) || control.stops.load(Ordering::Acquire) > 0 {
+            return Err("Courage is stopping".into());
+        }
+        if control.operation.swap(true, Ordering::AcqRel) {
+            return Err("A capture operation is already in progress".into());
+        }
+        Ok(Self(control.clone()))
+    }
+}
+struct StopRequest(Arc<Control>);
+impl StopRequest {
+    fn new(control: &Arc<Control>) -> Self {
+        control.stops.fetch_add(1, Ordering::AcqRel);
+        control.stop_epoch.fetch_add(1, Ordering::AcqRel);
+        control.stop_requested.store(true, Ordering::Release);
+        Self(control.clone())
+    }
+}
+impl Drop for StopRequest {
+    fn drop(&mut self) {
+        self.0.stops.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.0.operation.store(false, Ordering::Release);
+    }
 }
 
 impl AppState {
@@ -228,16 +301,18 @@ impl AppState {
         fs::create_dir_all(&output_dir).map_err(io_message)?;
         let store =
             ClipStore::open(data_dir.join("library.sqlite")).map_err(|error| error.to_string())?;
+        let voice_diagnostics = VoiceDiagnostics::new(&settings.voice_locale);
         Ok(Self {
             data_dir,
             default_output_dir,
             settings_path,
             settings,
             store,
+            control: Arc::new(Control::default()),
+            error: None,
             capture: None,
             voice: None,
-            #[cfg(windows)]
-            last_voice_save: None,
+            voice_diagnostics,
         })
     }
 
@@ -285,113 +360,149 @@ impl AppState {
 }
 
 #[tauri::command]
-fn engine_status(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
-) -> Result<EngineStatus, String> {
-    let mut state = lock_state(&state)?;
-    let running = refresh_capture_status(&mut state);
-    match reconcile_library(&mut state) {
-        Ok(true) => {
-            let _ = app.emit("library-changed", ());
+async fn engine_status(app: AppHandle) -> Result<EngineStatus, String> {
+    with_state(app, |app, state| {
+        refresh_capture_status(state);
+        match reconcile_library(state) {
+            Ok(true) => {
+                let _ = app.emit("library-changed", ());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = app.emit("library-error", error);
+            }
         }
-        Ok(false) => {}
-        Err(error) => {
-            let _ = app.emit("library-error", error);
-        }
-    }
-    Ok(status_for(&state, if running { "capturing" } else { "ready" }))
-}
-
-#[tauri::command]
-fn get_settings(state: State<'_, Mutex<AppState>>) -> Result<SettingsResponse, String> {
-    let state = lock_state(&state)?;
-    settings_response(&state)
-}
-
-#[tauri::command]
-fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
-    discover_audio_devices()
-}
-
-#[tauri::command]
-fn test_voice_phrase(
-    phrase: String,
-    state: State<'_, Mutex<AppState>>,
-) -> Result<VoiceTestResponse, String> {
-    let state = lock_state(&state)?;
-    let normalized = normalize_phrase(&phrase);
-    let wake = normalize_phrase(&state.settings.voice_wake_phrase);
-    let command = normalize_phrase(&state.settings.voice_command_phrase);
-    let wake_matched = normalized == wake || normalized.starts_with(&(wake.clone() + " "));
-    let command_matched =
-        normalized == command || normalized.ends_with(&(" ".to_owned() + &command));
-    Ok(VoiceTestResponse {
-        normalized: normalized.clone(),
-        wake_matched,
-        command_matched,
-        would_trigger: voice_would_trigger(
-            &normalized,
-            &wake,
-            &command,
-            state.settings.voice_wake_only,
-        ),
+        Ok(status_for(state))
     })
+    .await
 }
 
 #[tauri::command]
-fn save_settings(
+async fn get_settings(app: AppHandle) -> Result<SettingsResponse, String> {
+    with_state(app, |_, state| settings_response(state)).await
+}
+
+#[tauri::command]
+async fn list_audio_devices(app: AppHandle) -> Result<Vec<AudioDevice>, String> {
+    with_state(app, |_, _| discover_audio_devices()).await
+}
+
+#[tauri::command]
+fn test_voice_phrase(phrase: String, config: VoiceConfig) -> voice::Decision {
+    Matcher::default().decide(
+        &config,
+        &SpeechEvent {
+            kind: "result".into(),
+            id: 1,
+            phrase,
+            confidence: Some(1.0),
+            final_result: true,
+            ..Default::default()
+        },
+        Instant::now(),
+        Instant::now(),
+    )
+}
+
+#[tauri::command]
+async fn save_settings(
     settings: SettingsInput,
-    state: State<'_, Mutex<AppState>>,
+    app: AppHandle,
 ) -> Result<SettingsResponse, String> {
-    let mut state = lock_state(&state)?;
-    let output_dir = PathBuf::from(settings.output_dir.trim());
-    if !output_dir.is_absolute() {
-        return Err("Clip folder must be an absolute path.".to_owned());
-    }
-    if settings.hotkey.trim().is_empty() {
-        return Err("Save hotkey cannot be empty.".to_owned());
-    }
-    validate_settings(&settings)?;
-    fs::create_dir_all(&output_dir).map_err(io_message)?;
-    state.settings = SettingsFile {
-        output_dir: Some(output_dir.to_string_lossy().into_owned()),
-        selected_audio_device: settings.selected_audio_device,
-        hotkey: settings.hotkey,
-        replay_seconds: settings.replay_seconds.clamp(5, 120),
-        voice_enabled: settings.voice_enabled,
-        fps: settings.fps,
-        resolution_preset: settings.resolution_preset,
-        width: settings.width,
-        height: settings.height,
-        video_quality: settings.video_quality,
-        video_encoder: settings.video_encoder,
-        hardware_acceleration: settings.hardware_acceleration,
-        cursor_capture: settings.cursor_capture,
-        audio_enabled: settings.audio_enabled,
-        audio_sample_rate: settings.audio_sample_rate,
-        audio_channels: settings.audio_channels,
-        capture_source: settings.capture_source,
-        voice_wake_phrase: settings.voice_wake_phrase,
-        voice_command_phrase: settings.voice_command_phrase,
-        voice_wake_only: settings.voice_wake_only,
-        theme: settings.theme,
-    };
-    state.persist_settings()?;
-    diagnostic_event("settings.applied", "capture and UI settings persisted");
-    settings_response(&state)
+    let operation = Operation::acquire(app.state::<Arc<Control>>().inner())?;
+    with_state(app, move |app, state| {
+        let _operation = operation;
+        let output_dir = PathBuf::from(settings.output_dir.trim());
+        if !output_dir.is_absolute() {
+            return Err("Clip folder must be an absolute path.".to_owned());
+        }
+        if settings.hotkey.trim().is_empty() {
+            return Err("Save hotkey cannot be empty.".to_owned());
+        }
+        validate_settings(&settings)?;
+        fs::create_dir_all(&output_dir).map_err(io_message)?;
+        let previous = state.settings.clone();
+        state.settings = SettingsFile {
+            output_dir: Some(output_dir.to_string_lossy().into_owned()),
+            selected_audio_device: settings.selected_audio_device,
+            hotkey: settings.hotkey,
+            replay_seconds: settings.replay_seconds.clamp(5, 120),
+            voice_enabled: settings.voice_enabled,
+            fps: settings.fps,
+            resolution_preset: settings.resolution_preset,
+            width: settings.width,
+            height: settings.height,
+            video_quality: settings.video_quality,
+            video_encoder: settings.video_encoder,
+            hardware_acceleration: settings.hardware_acceleration,
+            cursor_capture: settings.cursor_capture,
+            audio_enabled: settings.audio_enabled,
+            audio_sample_rate: settings.audio_sample_rate,
+            audio_channels: settings.audio_channels,
+            capture_source: settings.capture_source,
+            voice_wake_phrase: settings.voice_wake_phrase,
+            voice_command_phrase: settings.voice_command_phrase,
+            voice_wake_only: settings.voice_wake_only,
+            voice_locale: settings.voice_locale,
+            theme: settings.theme,
+        };
+        if let Err(error) = state.persist_settings() {
+            state.settings = previous;
+            return Err(error);
+        }
+        // Apply grammar changes at the same serialized boundary as persistence.
+        if previous.voice_enabled != state.settings.voice_enabled
+            || voice_config(&previous) != voice_config(&state.settings)
+            || state.voice_diagnostics.test_mode
+        {
+            stop_voice_listener(state)?;
+            if cfg!(windows)
+                && state.settings.voice_enabled
+                && state
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.owner.state == CaptureState::Recording)
+            {
+                if let Err(error) = start_voice_listener(app, state) {
+                    let _ = app.emit("capture-error", error);
+                }
+            }
+        }
+        diagnostic_event("settings.applied", "capture and UI settings persisted");
+        settings_response(state)
+    })
+    .await
 }
 
 #[tauri::command]
-fn start_capture(
-    app: AppHandle,
-    state: State<'_, Mutex<AppState>>,
-) -> Result<EngineStatus, String> {
-    let mut state = lock_state(&state)?;
-    let was_running = refresh_capture_status(&mut state);
-    if was_running {
-        return Ok(status_for(&state, "capturing"));
+async fn start_capture(app: AppHandle) -> Result<EngineStatus, String> {
+    let control = app.state::<Arc<Control>>().inner().clone();
+    let epoch = control.stop_epoch.load(Ordering::Acquire);
+    let operation = Operation::acquire(&control)?;
+    with_state(app, move |app, state| {
+        let _operation = operation;
+        if let Err(error) = start_capture_inner(app, state, epoch) {
+            state.error = Some(error.clone());
+            let _ = app.emit("engine-status", status_for(state));
+            return Err(error);
+        }
+        Ok(status_for(state))
+    })
+    .await
+}
+
+fn start_capture_inner(
+    app: &AppHandle,
+    state: &mut AppState,
+    requested_epoch: u64,
+) -> Result<(), String> {
+    state.control.prepare_start(requested_epoch)?;
+    if refresh_capture_status(state) {
+        return Ok(());
     }
+    stop_voice_listener(state)?;
+    stop_capture_inner(state)?;
+    state.error = None;
     validate_settings_file(&state.settings)?;
     if state.settings.audio_enabled {
         let devices = discover_audio_devices()?;
@@ -403,130 +514,136 @@ fn start_capture(
             .as_ref()
             .is_none_or(|selected| !devices.iter().any(|device| &device.id == selected))
         {
-            state.settings.selected_audio_device =
-                devices.into_iter().find(|device| device.is_default).map(|device| device.id);
+            state.settings.selected_audio_device = devices
+                .iter()
+                .find(|device| device.is_default)
+                .or_else(|| devices.first())
+                .map(|device| device.id.clone());
         }
     }
     let segments_dir = new_session_dir(&state.data_dir)?;
     let (mut command, backend, audio_enabled, encoder, fps, resolution) =
-        match build_capture_command(&state, &segments_dir) {
+        match build_capture_command(state, &segments_dir) {
             Ok(command) => command,
             Err(error) => {
                 let _ = fs::remove_dir_all(&segments_dir);
                 return Err(error);
             }
         };
-    diagnostic_event(
-        "capture.starting",
-        &format!("backend={backend} fps={fps} resolution={resolution} encoder={encoder}"),
-    );
-    hide_console_window(&mut command);
-    let mut process = match command.spawn() {
-        Ok(process) => process,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&segments_dir);
-            diagnostic_event("capture.start_failed", &format!("FFmpeg spawn failed: {error}"));
-            return Err(
-                "Capture could not start. Verify that FFmpeg is installed and available on PATH."
-                    .to_owned(),
-            );
-        }
-    };
-    let process_status = match process.try_wait() {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = process.kill();
-            let _ = process.wait();
-            let _ = fs::remove_dir_all(&segments_dir);
-            diagnostic_event(
-                "capture.start_failed",
-                &format!("FFmpeg status check failed: {error}"),
-            );
-            return Err("Capture could not be initialized. Check the display and audio settings."
-                .to_owned());
-        }
-    };
-    if let Some(status) = process_status {
-        let mut details = String::new();
-        if let Some(mut stderr) = process.stderr.take() {
-            let _ = stderr.read_to_string(&mut details);
-        }
-        let _ = fs::remove_dir_all(&segments_dir);
-        let details = details.trim();
-        diagnostic_event(
-            "capture.start_failed",
-            &format!("FFmpeg exited immediately with {status}: {details}"),
-        );
-        return Err(
-            "Capture stopped immediately. Check the selected display, microphone, and FFmpeg settings."
-                .to_owned(),
-        );
-    }
-    drain_stderr(process.stderr.take());
     state.capture = Some(CaptureSession {
-        process,
-        segments_dir,
+        owner: CaptureProcess::new(segments_dir),
         backend,
         audio_enabled,
         encoder,
         fps,
         resolution,
     });
-    diagnostic_event("capture.started", "FFmpeg process is running");
-    if state.settings.voice_enabled {
-        if let Err(error) = start_voice_listener(&app, &mut state) {
+    let _ = app.emit("engine-status", status_for(state));
+    let result = state.capture.as_mut().expect("session assigned").owner.start(
+        &mut command,
+        &state.control.stop_requested,
+        Duration::from_secs(10),
+    );
+    if let Err(error) = result {
+        let cleanup = stop_capture_inner(state);
+        state.error = Some(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; {cleanup}"),
+        });
+        let _ = app.emit("engine-status", status_for(state));
+        return Err(state.error.clone().unwrap_or_default());
+    }
+    if cfg!(windows) && state.settings.voice_enabled {
+        if let Err(error) = start_voice_listener(app, state) {
             let _ = app.emit("capture-error", error);
         }
     }
-    Ok(status_for(&state, "capturing"))
-}
-
-#[tauri::command]
-fn stop_capture(state: State<'_, Mutex<AppState>>) -> Result<EngineStatus, String> {
-    let mut state = lock_state(&state)?;
-    let result = stop_capture_inner(&mut state);
-    stop_voice_listener(&mut state);
-    result?;
-    Ok(status_for(&state, "ready"))
-}
-
-#[tauri::command]
-fn save_replay(app: AppHandle, state: State<'_, Mutex<AppState>>) -> Result<ClipResponse, String> {
-    let mut state = lock_state(&state)?;
-    let clip = save_replay_inner(&mut state)?;
-    notify_clip_saved(&app, &clip, "Replay saved");
-    Ok(clip)
-}
-
-#[tauri::command]
-fn list_clips(state: State<'_, Mutex<AppState>>) -> Result<Vec<ClipResponse>, String> {
-    let mut state = lock_state(&state)?;
-    reconcile_library(&mut state)?;
-    state
-        .store
-        .list_clips()
-        .map_err(|error| error.to_string())
-        .map(|clips| clips.into_iter().map(to_response).collect())
-}
-
-#[tauri::command]
-fn delete_clip(app: AppHandle, id: i64, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let state = lock_state(&state)?;
-    let record = state
-        .store
-        .list_clips()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|clip| clip.id == id)
-        .ok_or("Clip was not found in the local library")?;
-    if record.path.exists() {
-        fs::remove_file(&record.path)
-            .map_err(|error| format!("Could not delete clip {}: {error}", record.path.display()))?;
-    }
-    state.store.delete_clip(id).map_err(|error| error.to_string())?;
-    diagnostic_event("library.clip_deleted", &format!("id={id}"));
-    let _ = app.emit("library-changed", ());
+    let _ = app.emit("engine-status", status_for(state));
     Ok(())
+}
+
+#[tauri::command]
+async fn stop_capture(app: AppHandle) -> Result<EngineStatus, String> {
+    let request = StopRequest::new(app.state::<Arc<Control>>().inner());
+    with_state(app, move |app, state| {
+        let _request = request;
+        if let Some(capture) = &mut state.capture {
+            capture.owner.state = CaptureState::Stopping;
+        }
+        let _ = app.emit("engine-status", status_for(state));
+        let voice = stop_voice_listener(state);
+        let capture = stop_capture_inner(state);
+        state.error = voice.as_ref().err().or(capture.as_ref().err()).cloned();
+        let _ = app.emit("engine-status", status_for(state));
+        voice?;
+        capture?;
+        Ok(status_for(state))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_replay(app: AppHandle) -> Result<ClipResponse, String> {
+    let operation = Operation::acquire(app.state::<Arc<Control>>().inner())?;
+    with_state(app, move |app, state| {
+        let _operation = operation;
+        let clip = save_replay_inner(state)?;
+        notify_clip_saved(app, &clip, "Replay saved");
+        Ok(clip)
+    })
+    .await
+}
+
+async fn with_state<T: Send + 'static>(
+    app: AppHandle,
+    action: impl FnOnce(&AppHandle, &mut AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<Mutex<AppState>>();
+        let mut state = state.lock().map_err(|_| "Courage state is unavailable")?;
+        if state.control.exiting.load(Ordering::Acquire) {
+            return Err("Courage is shutting down".into());
+        }
+        action(&app, &mut state)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_clips(app: AppHandle) -> Result<Vec<ClipResponse>, String> {
+    with_state(app, |_, state| {
+        reconcile_library(state)?;
+        state
+            .store
+            .list_clips()
+            .map_err(|error| error.to_string())
+            .map(|clips| clips.into_iter().map(to_response).collect())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
+    with_state(app, move |app, state| {
+        let record = state
+            .store
+            .list_clips()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|clip| clip.id == id)
+            .ok_or("Clip was not found in the local library")?;
+        if record.path.exists() {
+            fs::remove_file(&record.path).map_err(|error| {
+                format!("Could not delete clip {}: {error}", record.path.display())
+            })?;
+        }
+        state.store.delete_clip(id).map_err(|error| error.to_string())?;
+        diagnostic_event("library.clip_deleted", &format!("id={id}"));
+        let _ = app.emit("library-changed", ());
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -543,12 +660,6 @@ fn open_path(path: String) -> Result<(), String> {
         Command::new("xdg-open").arg(&path).spawn()
     };
     result.map(|_| ()).map_err(io_message)
-}
-
-fn lock_state<'a>(
-    state: &'a State<'_, Mutex<AppState>>,
-) -> Result<std::sync::MutexGuard<'a, AppState>, String> {
-    state.lock().map_err(|_| "Courage state is unavailable".to_owned())
 }
 
 fn settings_response(state: &AppState) -> Result<SettingsResponse, String> {
@@ -584,6 +695,7 @@ fn settings_response(state: &AppState) -> Result<SettingsResponse, String> {
         voice_wake_phrase: state.settings.voice_wake_phrase.clone(),
         voice_command_phrase: state.settings.voice_command_phrase.clone(),
         voice_wake_only: state.settings.voice_wake_only,
+        voice_locale: state.settings.voice_locale.clone(),
         theme: state.settings.theme.clone(),
     })
 }
@@ -591,6 +703,9 @@ fn settings_response(state: &AppState) -> Result<SettingsResponse, String> {
 fn reconcile_library(state: &mut AppState) -> Result<bool, String> {
     let mut changed = false;
     for record in state.store.list_clips().map_err(|error| error.to_string())? {
+        if state.control.exiting.load(Ordering::Acquire) {
+            return Err("Library reconciliation cancelled by exit".into());
+        }
         if !record.path.is_file() {
             changed |= state.store.delete_clip(record.id).map_err(|error| error.to_string())?;
         }
@@ -599,6 +714,9 @@ fn reconcile_library(state: &mut AppState) -> Result<bool, String> {
     for entry in fs::read_dir(&output_dir).map_err(|error| {
         format!("Could not reconcile clip folder {}: {error}", output_dir.display())
     })? {
+        if state.control.exiting.load(Ordering::Acquire) {
+            return Err("Library reconciliation cancelled by exit".into());
+        }
         let entry = entry.map_err(io_message)?;
         let path = entry.path();
         let is_temporary = path
@@ -631,6 +749,13 @@ fn is_stable_clip(path: &Path) -> bool {
 }
 
 fn validate_settings(settings: &SettingsInput) -> Result<(), String> {
+    VoiceConfig {
+        wake_phrase: settings.voice_wake_phrase.clone(),
+        command_phrase: settings.voice_command_phrase.clone(),
+        wake_only: settings.voice_wake_only,
+        locale: settings.voice_locale.clone(),
+    }
+    .validate()?;
     validate_capture_values(CaptureValidation {
         replay_seconds: settings.replay_seconds,
         fps: settings.fps,
@@ -644,12 +769,11 @@ fn validate_settings(settings: &SettingsInput) -> Result<(), String> {
         channels: settings.audio_channels,
         source: &settings.capture_source,
         theme: &settings.theme,
-        wake_phrase: &settings.voice_wake_phrase,
-        command_phrase: &settings.voice_command_phrase,
     })
 }
 
 fn validate_settings_file(settings: &SettingsFile) -> Result<(), String> {
+    voice_config(settings).validate()?;
     validate_capture_values(CaptureValidation {
         replay_seconds: settings.replay_seconds,
         fps: settings.fps,
@@ -663,8 +787,6 @@ fn validate_settings_file(settings: &SettingsFile) -> Result<(), String> {
         channels: settings.audio_channels,
         source: &settings.capture_source,
         theme: &settings.theme,
-        wake_phrase: &settings.voice_wake_phrase,
-        command_phrase: &settings.voice_command_phrase,
     })
 }
 
@@ -681,8 +803,6 @@ struct CaptureValidation<'a> {
     channels: u8,
     source: &'a str,
     theme: &'a str,
-    wake_phrase: &'a str,
-    command_phrase: &'a str,
 }
 
 fn validate_capture_values(values: CaptureValidation<'_>) -> Result<(), String> {
@@ -723,14 +843,6 @@ fn validate_capture_values(values: CaptureValidation<'_>) -> Result<(), String> 
     if !["light", "dark", "rusty"].contains(&values.theme) {
         return Err("Theme must be light, dark, or rusty.".to_owned());
     }
-    if normalize_phrase(values.wake_phrase).is_empty()
-        || normalize_phrase(values.command_phrase).is_empty()
-    {
-        return Err("Voice wake and command phrases cannot be empty.".to_owned());
-    }
-    if values.wake_phrase.chars().count() > 80 || values.command_phrase.chars().count() > 80 {
-        return Err("Voice wake and command phrases must be 80 characters or fewer.".to_owned());
-    }
     Ok(())
 }
 
@@ -745,7 +857,7 @@ fn resolution_label(settings: &SettingsFile) -> String {
     }
 }
 
-fn status_for(state: &AppState, requested_state: &str) -> EngineStatus {
+fn status_for(state: &AppState) -> EngineStatus {
     let (backend, fps, resolution, video_encoder) = state
         .capture
         .as_ref()
@@ -770,11 +882,26 @@ fn status_for(state: &AppState, requested_state: &str) -> EngineStatus {
             )
         });
     EngineStatus {
-        state: requested_state.to_owned(),
+        revision: state.control.revision.fetch_add(1, Ordering::Relaxed) + 1,
+        state: state.capture.as_ref().map(|capture| capture.owner.state).unwrap_or(
+            if state.error.is_some() { CaptureState::Error } else { CaptureState::Stopped },
+        ),
+        session_id: state.capture.as_ref().map(|capture| capture.owner.session_id.clone()),
+        pid: state.capture.as_ref().and_then(|capture| capture.owner.pid()),
+        session_directory: state
+            .capture
+            .as_ref()
+            .map(|capture| capture.owner.directory.to_string_lossy().into_owned()),
+        error: state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.owner.error.clone())
+            .or_else(|| state.error.clone()),
         platform: std::env::consts::OS.to_owned(),
         backend,
         audio_device: state.settings.selected_audio_device.clone(),
         voice_trigger: voice_trigger_status(state),
+        voice: state.voice_diagnostics.clone(),
         output_dir: state.output_dir().to_string_lossy().into_owned(),
         replay_seconds: state.settings.replay_seconds,
         fps,
@@ -788,7 +915,7 @@ fn voice_trigger_status(state: &AppState) -> String {
     if !state.settings.voice_enabled {
         return "Voice trigger disabled".to_owned();
     }
-    if state.voice.is_some() {
+    if state.voice_diagnostics.listening {
         return if cfg!(windows) {
             "Windows Speech · listening in tray".to_owned()
         } else {
@@ -803,48 +930,26 @@ fn voice_trigger_status(state: &AppState) -> String {
 }
 
 fn refresh_capture_status(state: &mut AppState) -> bool {
-    let Some(capture) = state.capture.as_mut() else {
-        return false;
-    };
-    let diagnostic = match capture.process.try_wait() {
-        Ok(None) => return true,
-        Ok(Some(status)) => format!("FFmpeg exited with {status}"),
-        Err(error) => format!("Could not poll FFmpeg capture: {error}"),
-    };
-    if let Some(mut capture) = state.capture.take() {
-        let _ = capture.process.wait();
-        let _ = fs::remove_dir_all(capture.segments_dir);
+    if let Some(capture) = state.capture.as_mut() {
+        if let Err(error) = capture.owner.poll() {
+            state.error = Some(error);
+            let voice = stop_voice_listener(state);
+            let cleanup = stop_capture_inner(state);
+            if let Err(error) = voice.and(cleanup) {
+                state.error = Some(error);
+            }
+            return false;
+        }
+        return capture.owner.state == CaptureState::Recording;
     }
-    stop_voice_listener(state);
-    diagnostic_event("capture.ended_unexpectedly", &diagnostic);
     false
 }
 
 fn stop_capture_inner(state: &mut AppState) -> Result<(), String> {
-    if let Some(mut capture) = state.capture.take() {
-        let mut failure = None;
-        if let Err(error) = capture.process.kill() {
-            if !matches!(error.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::NotFound) {
-                failure = Some(format!("Could not stop capture process: {error}"));
-            }
-        }
-        if let Err(error) = capture.process.wait() {
-            failure.get_or_insert_with(|| format!("Could not reap capture process: {error}"));
-        }
-        if let Err(error) = fs::remove_dir_all(&capture.segments_dir) {
-            failure.get_or_insert_with(|| {
-                format!("Capture stopped, but its temporary session could not be removed: {error}")
-            });
-        }
-        if let Some(failure) = failure {
-            diagnostic_event("capture.stop_failed", &failure);
-            return Err(
-                "Capture stopped, but temporary resources could not be fully released. Close any player using a clip and try again."
-                    .to_owned(),
-            );
-        }
-        diagnostic_event("capture.stopped", "FFmpeg process reaped and session removed");
+    if let Some(capture) = state.capture.as_mut() {
+        capture.owner.stop()?;
     }
+    state.capture = None;
     Ok(())
 }
 
@@ -855,7 +960,17 @@ fn build_capture_command(
     let segments = segments_dir.join("segment-%05d.mp4");
     let wrap = (state.settings.replay_seconds + 15).clamp(30, 150);
     let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-stdin",
+        "-progress",
+        "pipe:1",
+        "-stats_period",
+        "0.1",
+    ]);
     let fps = state.settings.fps;
     command.args(video_input_args(state)?.as_slice());
     let audio_args = audio_input_args(state);
@@ -886,6 +1001,7 @@ fn build_capture_command(
     let encoder = resolve_video_encoder(
         &state.settings.video_encoder,
         &state.settings.hardware_acceleration,
+        &state.control.stop_requested,
     )?;
     let (preset, crf) = video_quality_args(&state.settings.video_quality)?;
     command.args(["-c:v", &encoder]);
@@ -924,8 +1040,8 @@ fn build_capture_command(
             "+faststart",
         ])
         .arg(segments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     Ok((
         command,
@@ -1001,7 +1117,11 @@ fn video_quality_args(quality: &str) -> Result<(&'static str, &'static str), Str
     }
 }
 
-fn resolve_video_encoder(preference: &str, hardware: &str) -> Result<String, String> {
+fn resolve_video_encoder(
+    preference: &str,
+    hardware: &str,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     let requested = if preference == "auto" { hardware } else { preference };
     let candidates = match requested {
         "auto" => ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"].as_slice(),
@@ -1014,20 +1134,20 @@ fn resolve_video_encoder(preference: &str, hardware: &str) -> Result<String, Str
     let mut probe = Command::new("ffmpeg");
     probe.args(["-hide_banner", "-encoders"]);
     hide_console_window(&mut probe);
-    let encoders =
-        probe.output().map_err(|error| format!("Could not inspect FFmpeg encoders: {error}"))?;
+    let encoders = ManagedChild::output(&mut probe, Duration::from_secs(5), Some(cancel))
+        .map_err(|error| format!("Could not inspect FFmpeg encoders: {error}"))?;
     let text = String::from_utf8_lossy(&encoders.stdout);
     Ok(candidates
         .iter()
         .filter(|candidate| {
             text.lines().any(|line| line.split_whitespace().any(|field| field == **candidate))
         })
-        .find(|candidate| encoder_works(candidate))
+        .find(|candidate| encoder_works(candidate, cancel))
         .unwrap_or(&"libx264")
         .to_string())
 }
 
-fn encoder_works(encoder: &&str) -> bool {
+fn encoder_works(encoder: &&str, cancel: &AtomicBool) -> bool {
     if *encoder == "libx264" {
         return true;
     }
@@ -1049,14 +1169,19 @@ fn encoder_works(encoder: &&str) -> bool {
         "-",
     ]);
     hide_console_window(&mut command);
-    command.output().is_ok_and(|output| output.status.success())
+    ManagedChild::output(&mut command, Duration::from_secs(3), Some(cancel))
+        .is_ok_and(|output| output.status.success())
 }
 
 fn new_session_dir(data_dir: &Path) -> Result<PathBuf, String> {
     let root = data_dir.join("rolling-buffer");
     fs::create_dir_all(&root).map_err(io_message)?;
     for suffix in 0..100 {
-        let session = root.join(format!("session-{}-{suffix}", unix_timestamp_millis()));
+        let session = root.join(format!(
+            "session-{}-{}-{suffix}",
+            std::process::id(),
+            unix_timestamp_millis()
+        ));
         match fs::create_dir(&session) {
             Ok(()) => return Ok(session),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1086,10 +1211,19 @@ fn discover_audio_devices() -> Result<Vec<AudioDevice>, String> {
 }
 
 fn discover_windows_audio_devices() -> Result<Vec<AudioDevice>, String> {
-    let output = match Command::new("ffmpeg")
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-        .output()
-    {
+    let output = match ManagedChild::output(
+        Command::new("ffmpeg").args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ]),
+        Duration::from_secs(5),
+        None,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
@@ -1111,17 +1245,27 @@ fn discover_windows_audio_devices() -> Result<Vec<AudioDevice>, String> {
             id: name.clone(),
             name,
             backend: "DirectShow".to_owned(),
-            is_default: devices.is_empty(),
+            // Enumeration order does not identify the Windows default speech input.
+            is_default: false,
         });
     }
     Ok(devices)
 }
 
 fn discover_avfoundation_audio_devices() -> Result<Vec<AudioDevice>, String> {
-    let output = match Command::new("ffmpeg")
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .output()
-    {
+    let output = match ManagedChild::output(
+        Command::new("ffmpeg").args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ]),
+        Duration::from_secs(5),
+        None,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
@@ -1153,7 +1297,11 @@ fn discover_avfoundation_audio_devices() -> Result<Vec<AudioDevice>, String> {
 }
 
 fn discover_pulse_audio_devices() -> Result<Vec<AudioDevice>, String> {
-    let output = match Command::new("pactl").args(["list", "short", "sources"]).output() {
+    let output = match ManagedChild::output(
+        Command::new("pactl").args(["list", "short", "sources"]),
+        Duration::from_secs(5),
+        None,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(Vec::new()),
     };
@@ -1197,6 +1345,11 @@ fn completed_segments(path: &Path, replay_seconds: u64) -> Result<Vec<PathBuf>, 
 }
 
 fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
+    if state.control.exiting.load(Ordering::Acquire)
+        || state.control.stop_requested.load(Ordering::Acquire)
+    {
+        return Err("Save rejected: capture is stopping".into());
+    }
     if !refresh_capture_status(state) {
         return Err(
             "Replay buffer is not recording. Start capture and check the selected microphone."
@@ -1204,7 +1357,7 @@ fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
         );
     }
     let capture = state.capture.as_ref().ok_or("Replay buffer is not recording")?;
-    let segments = completed_segments(&capture.segments_dir, state.settings.replay_seconds)?;
+    let segments = completed_segments(&capture.owner.directory, state.settings.replay_seconds)?;
     if segments.is_empty() {
         return Err("The replay buffer is warming up. Try again after a few seconds.".to_owned());
     }
@@ -1212,7 +1365,7 @@ fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
     fs::create_dir_all(&output_dir).map_err(io_message)?;
     let timestamp = unix_timestamp_millis();
     let output = output_dir.join(format!("courage-{timestamp}.mp4"));
-    concat_segments(&segments, &output)?;
+    concat_segments(&segments, &output, &state.control.stop_requested)?;
     let size = fs::metadata(&output).map_err(io_message)?.len();
     if size == 0 {
         return Err("FFmpeg created an empty clip. Check the selected capture devices.".to_owned());
@@ -1235,7 +1388,7 @@ fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
     })
 }
 
-fn concat_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> {
+fn concat_segments(segments: &[PathBuf], output: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let list_path = output.with_extension("concat.txt");
     let list = segments
         .iter()
@@ -1257,7 +1410,7 @@ fn concat_segments(segments: &[PathBuf], output: &Path) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     hide_console_window(&mut command);
-    let result = match command.output() {
+    let result = match ManagedChild::output(&mut command, Duration::from_secs(30), Some(cancel)) {
         Ok(result) => result,
         Err(error) => {
             let _ = fs::remove_file(&list_path);
@@ -1291,7 +1444,7 @@ fn probe_duration_ms(path: &Path) -> Option<i64> {
     let mut command = Command::new("ffprobe");
     command.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(path);
     hide_console_window(&mut command);
-    let output = command.output().ok()?;
+    let output = ManagedChild::output(&mut command, Duration::from_secs(5), None).ok()?;
     let seconds = String::from_utf8_lossy(&output.stdout).trim().parse::<f64>().ok()?;
     Some((seconds * 1000.0) as i64)
 }
@@ -1337,150 +1490,218 @@ fn normalize_phrase(value: &str) -> String {
     normalized.trim().to_owned()
 }
 
-fn voice_would_trigger(heard: &str, wake: &str, command: &str, wake_only: bool) -> bool {
-    if wake_only {
-        heard == wake
-    } else {
-        heard == format!("{wake} {command}")
+fn voice_config(settings: &SettingsFile) -> VoiceConfig {
+    VoiceConfig {
+        wake_phrase: settings.voice_wake_phrase.clone(),
+        command_phrase: settings.voice_command_phrase.clone(),
+        wake_only: settings.voice_wake_only,
+        locale: settings.voice_locale.clone(),
     }
-}
-
-#[cfg(windows)]
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(windows)]
-fn handle_voice_trigger(app: &AppHandle) -> Option<Result<ClipResponse, String>> {
-    let state = app.state::<Mutex<AppState>>();
-    let mut state = state.lock().ok()?;
-    if state.last_voice_save.is_some_and(|last| last.elapsed() < VOICE_COOLDOWN) {
-        return None;
-    }
-    let result = save_replay_inner(&mut state);
-    if result.is_ok() {
-        state.last_voice_save = Some(Instant::now());
-    }
-    Some(result)
-}
-
-#[cfg(windows)]
-fn parse_voice_result(line: &str) -> Option<VoiceRecognitionResult> {
-    let mut fields = line.strip_prefix("VOICE_RESULT\t")?.splitn(2, '\t');
-    let phrase = fields.next()?.to_owned();
-    let confidence = fields.next()?.parse::<f32>().ok()?;
-    Some(VoiceRecognitionResult { phrase, confidence })
 }
 
 fn start_voice_listener(app: &AppHandle, state: &mut AppState) -> Result<(), String> {
+    start_voice_session(app, state, voice_config(&state.settings), false)
+}
+
+fn start_voice_session(
+    app: &AppHandle,
+    state: &mut AppState,
+    config: VoiceConfig,
+    test_mode: bool,
+) -> Result<(), String> {
+    config.validate()?;
+    stop_voice_listener(state)?;
+    if state.control.exiting.load(Ordering::Acquire)
+        || (!test_mode && state.control.stop_requested.load(Ordering::Acquire))
+    {
+        return Err("Courage is shutting down".into());
+    }
     #[cfg(windows)]
     {
-        if let Some(voice) = state.voice.as_mut() {
-            if voice.process.try_wait().map_err(io_message)?.is_none() {
-                return Ok(());
-            }
-        }
-        state.voice = None;
-        let wake_phrase = normalize_phrase(&state.settings.voice_wake_phrase);
-        let command_phrase = normalize_phrase(&state.settings.voice_command_phrase);
-        let expected_phrase = if state.settings.voice_wake_only {
-            wake_phrase.clone()
-        } else {
-            format!("{wake_phrase} {command_phrase}")
-        };
-        let expected_phrase = powershell_quote(&expected_phrase);
-        let script = format!(
-            r#"
-Add-Type -AssemblyName System.Speech
-$recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-# System.Speech binds to the Windows default input device. The selected
-# recording device remains authoritative for FFmpeg capture.
-$recognizer.SetInputToDefaultAudioDevice()
-$grammar = New-Object System.Speech.Recognition.DictationGrammar
-$recognizer.LoadGrammar($grammar)
-while ($true) {{
-  $result = $recognizer.Recognize()
-  if ($result) {{
-    $normalized = (($result.Text.ToLowerInvariant() -replace '[^\p{{L}}\p{{Nd}}]+', ' ') -replace '\s+', ' ').Trim()
-    $confidence = $result.Confidence.ToString([Globalization.CultureInfo]::InvariantCulture)
-    [Console]::WriteLine("VOICE_RESULT`t$normalized`t$confidence")
-    [Console]::Out.Flush()
-  }}
-  if ($result -and $normalized -eq {expected_phrase} -and $result.Confidence -ge {confidence_threshold}) {{
-    [Console]::WriteLine('COURAGE_TRIGGER')
-    [Console]::Out.Flush()
-  }}
-}}
-"#,
-            expected_phrase = expected_phrase,
-            confidence_threshold = VOICE_CONFIDENCE_THRESHOLD,
-        );
         let mut command = Command::new("powershell.exe");
-        command
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        hide_console_window(&mut command);
-        let mut process = command
-            .spawn()
-            .map_err(|error| format!("Windows voice trigger could not start: {error}"))?;
-        let stdout = match process.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let _ = process.kill();
-                let _ = process.wait();
-                return Err(
-                    "Windows voice trigger did not provide an audio recognition stream".to_owned()
-                );
-            }
-        };
-        let app = app.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(result) = parse_voice_result(&line) {
-                    let _ = app.emit("voice-result", result);
-                    continue;
-                }
-                if line.trim() != "COURAGE_TRIGGER" {
-                    continue;
-                }
-                if let Some(result) = handle_voice_trigger(&app) {
-                    match result {
-                        Ok(clip) => notify_clip_saved(&app, &clip, "Voice trigger"),
-                        Err(error) => {
-                            let _ = app.emit("capture-error", error);
-                        }
-                    }
-                }
-            }
-            let should_report = app
-                .state::<Mutex<AppState>>()
-                .lock()
-                .map(|state| state.capture.is_some() && state.voice.is_some())
-                .unwrap_or(false);
-            if should_report {
-                let _ = app.emit(
-                    "capture-error",
-                    "Windows voice trigger stopped. Check microphone privacy permissions and restart capture.",
-                );
-            }
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            voice::SCRIPT,
+        ]);
+        let mut process = ManagedChild::spawn(&mut command)
+            .map_err(|error| format!("Windows Speech could not start: {error}"))?;
+        process
+            .send(
+                format!("{}\n", serde_json::to_string(&config).map_err(|error| error.to_string())?)
+                    .as_bytes(),
+            )
+            .map_err(io_message)?;
+        let generation = format!("voice-{}-{}", process.id(), unix_timestamp_millis());
+        state.voice_diagnostics = VoiceDiagnostics::new(&config.locale);
+        state.voice_diagnostics.generation = Some(generation.clone());
+        state.voice_diagnostics.test_mode = test_mode;
+        state.voice_diagnostics.availability = "starting".into();
+        state.voice = Some(VoiceSession {
+            process,
+            config,
+            generation,
+            capture_session: state.capture.as_ref().map(|capture| capture.owner.session_id.clone()),
+            test_mode,
+            matcher: Matcher::default(),
+            deadline: Instant::now() + Duration::from_secs(15),
+            ready: false,
+            test_until: test_mode.then(|| Instant::now() + Duration::from_secs(30)),
         });
-        state.voice = Some(VoiceSession { process });
+        let _ = app.emit("engine-status", status_for(state));
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, state);
-        Ok(())
+        let _ = (app, test_mode);
+        Err("Microphone recognition requires Windows System.Speech".into())
     }
 }
 
-fn stop_voice_listener(state: &mut AppState) {
-    if let Some(mut voice) = state.voice.take() {
-        let _ = voice.process.kill();
-        let _ = voice.process.wait();
+fn stop_voice_listener(state: &mut AppState) -> Result<(), String> {
+    if let Some(voice) = state.voice.as_mut() {
+        voice.process.shutdown(b"stop\n", Duration::from_secs(3)).map_err(io_message)?;
     }
+    state.voice = None;
+    state.voice_diagnostics.listening = false;
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_voice_test(app: AppHandle, config: VoiceConfig) -> Result<VoiceDiagnostics, String> {
+    let operation = Operation::acquire(app.state::<Arc<Control>>().inner())?;
+    with_state(app, move |app, state| {
+        let _operation = operation;
+        start_voice_session(app, state, config, true)?;
+        Ok(state.voice_diagnostics.clone())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn stop_voice_test(app: AppHandle) -> Result<VoiceDiagnostics, String> {
+    with_state(app, |app, state| {
+        if state.voice.as_ref().is_some_and(|voice| voice.test_mode) {
+            stop_voice_listener(state)?;
+        }
+        let _ = app.emit("engine-status", status_for(state));
+        Ok(state.voice_diagnostics.clone())
+    })
+    .await
+}
+
+fn poll_voice(app: &AppHandle, state: &mut AppState) {
+    let Some(voice) = state.voice.as_mut() else { return };
+    let now = Instant::now();
+    let mut failure = None;
+    let mut changed = false;
+    let expired = voice.test_until.is_some_and(|until| now >= until);
+    let mut results = Vec::new();
+    for line in voice.process.lines() {
+        let Ok(event) = serde_json::from_str::<SpeechEvent>(&line.text) else { continue };
+        match event.kind.as_str() {
+            "ready" => {
+                voice.ready = true;
+                state.voice_diagnostics.availability = "available".into();
+                state.voice_diagnostics.listening = true;
+                if let Some(locale) = event.locale {
+                    state.voice_diagnostics.locale = locale;
+                }
+                if let Some(microphone) = event.microphone {
+                    state.voice_diagnostics.microphone = microphone;
+                }
+                state.voice_diagnostics.audio_format = event.audio_format;
+                changed = true;
+            }
+            "error" => {
+                failure = Some(event.error.unwrap_or_else(|| "Recognition engine failed".into()))
+            }
+            "result" => {
+                let decision = voice.matcher.decide(&voice.config, &event, line.received, now);
+                results.push(RecognitionResult {
+                    generation: voice.generation.clone(),
+                    phrase: event.phrase,
+                    confidence: event.confidence,
+                    decision,
+                    test_mode: voice.test_mode,
+                    saved: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    if !voice.ready && now >= voice.deadline {
+        failure = Some("Recognition engine did not become ready before its deadline".into());
+    }
+    if !matches!(voice.process.try_wait(), Ok(None)) {
+        failure.get_or_insert_with(|| {
+            format!("Recognition worker exited: {}", voice.process.stderr())
+        });
+    }
+    let same_session = voice.capture_session.as_ref()
+        == state.capture.as_ref().map(|capture| &capture.owner.session_id)
+        && state.settings.voice_enabled
+        && voice.config == voice_config(&state.settings);
+    for mut result in results {
+        if result.decision.would_trigger {
+            if result.test_mode {
+                result.decision.reason = "Matched in microphone test; saving is disabled".into();
+            } else if !same_session || !state.voice_diagnostics.listening || failure.is_some() {
+                result.decision.would_trigger = false;
+                result.decision.reason = "Inactive recording session or failed recognizer".into();
+            } else {
+                let saved = Operation::acquire(&state.control)
+                    .and_then(|_operation| save_replay_inner(state));
+                match saved {
+                    Ok(clip) => {
+                        result.saved = true;
+                        notify_clip_saved(app, &clip, "Voice trigger");
+                    }
+                    Err(error) => {
+                        result.decision.reason = format!("Save not performed: {error}");
+                    }
+                }
+            }
+        }
+        let _ = app.emit("voice-result", result);
+    }
+    if expired || failure.is_some() {
+        if let Err(error) = stop_voice_listener(state) {
+            failure = Some(error);
+        }
+        if let Some(error) = failure {
+            state.voice_diagnostics.availability = "error".into();
+            state.voice_diagnostics.error = Some(error);
+        }
+        changed = true;
+    }
+    if changed {
+        let _ = app.emit("engine-status", status_for(state));
+    }
+}
+
+fn start_supervisor(app: &AppHandle) -> io::Result<()> {
+    let handle = app.clone();
+    let control = app.state::<Arc<Control>>().inner().clone();
+    let worker =
+        std::thread::Builder::new().name("courage-supervisor".into()).spawn(move || {
+            while !control.exit_complete.load(Ordering::Acquire) {
+                if !control.exiting.load(Ordering::Acquire) {
+                    if let Ok(mut state) = handle.state::<Mutex<AppState>>().try_lock() {
+                        refresh_capture_status(&mut state);
+                        poll_voice(&handle, &mut state);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })?;
+    *app.state::<Mutex<Option<std::thread::JoinHandle<()>>>>()
+        .lock()
+        .map_err(|_| io::Error::other("supervisor state unavailable"))? = Some(worker);
+    Ok(())
 }
 
 fn load_settings(path: &Path) -> Result<SettingsFile, String> {
@@ -1490,15 +1711,6 @@ fn load_settings(path: &Path) -> Result<SettingsFile, String> {
     let data = fs::read(path).map_err(io_message)?;
     serde_json::from_slice(&data)
         .map_err(|error| format!("Could not read Courage settings: {error}"))
-}
-
-fn drain_stderr(stderr: Option<impl Read + Send + 'static>) {
-    if let Some(mut stderr) = stderr {
-        std::thread::spawn(move || {
-            let mut sink = io::sink();
-            let _ = io::copy(&mut stderr, &mut sink);
-        });
-    }
 }
 
 fn unix_timestamp_millis() -> u128 {
@@ -1541,54 +1753,85 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-#[cfg(windows)]
-fn disable_windows_browser_surface(app: &AppHandle) -> Result<(), String> {
-    let webview = app
-        .get_webview_window("main")
-        .ok_or("Courage main WebView was not available during setup")?;
-    let failure = std::sync::Arc::new(Mutex::new(None::<String>));
-    let callback_failure = std::sync::Arc::clone(&failure);
-    webview
-        .with_webview(move |webview| {
-            let result = unsafe {
-                webview
-                    .controller()
-                    .CoreWebView2()
-                    .and_then(|core| core.Settings())
-                    .and_then(|settings| settings.SetAreDefaultContextMenusEnabled(false))
-            };
-            if let Err(error) = result {
-                if let Ok(mut failure) = callback_failure.lock() {
-                    *failure = Some(format!("Could not disable WebView2 context menus: {error}"));
-                }
-            }
-        })
-        .map_err(|error| format!("Could not configure the Courage WebView: {error}"))?;
-    if let Some(error) = failure.lock().map_err(|_| "WebView setup state is unavailable")?.take() {
-        return Err(error);
+#[tauri::command]
+fn hide_to_tray(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
     }
-    Ok(())
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    request_exit(&app);
+}
+
+fn request_exit(app: &AppHandle) {
+    let control = app.state::<Arc<Control>>().inner().clone();
+    if control.exiting.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    control.stop_epoch.fetch_add(1, Ordering::AcqRel);
+    control.stop_requested.store(true, Ordering::Release);
+    let _ = app.emit("app-exiting", ());
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let state = app.state::<Mutex<AppState>>();
+            let mut state = state.lock().map_err(|_| "Shutdown state unavailable".to_owned())?;
+            let voice = stop_voice_listener(&mut state);
+            let capture = stop_capture_inner(&mut state);
+            voice.and(capture)
+        })();
+        if let Err(error) = result {
+            // Keep the owner and window alive when cleanup failed. A repeated Quit retries.
+            diagnostic_event("app.shutdown_failed", &error);
+            let _ = app.emit("capture-error", format!("Shutdown incomplete: {error}"));
+            let _ = app.emit("app-exit-failed", ());
+            control.exiting.store(false, Ordering::Release);
+            show_main_window(&app);
+            return;
+        }
+        control.exit_complete.store(true, Ordering::Release);
+        if let Some(worker) = app
+            .state::<Mutex<Option<std::thread::JoinHandle<()>>>>()
+            .lock()
+            .ok()
+            .and_then(|mut worker| worker.take())
+        {
+            let _ = worker.join();
+        }
+        diagnostic_event(
+            "app.shutdown_complete",
+            "owned processes reaped; readers joined; sessions removed",
+        );
+        app.exit(0);
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir().map_err(|error| error.to_string())?;
             let state = AppState::new(data_dir)
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            app.manage(state.control.clone());
             app.manage(Mutex::new(state));
-
-            #[cfg(windows)]
-            disable_windows_browser_surface(app.handle())
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            app.manage(Mutex::new(None::<std::thread::JoinHandle<()>>));
 
             let show = MenuItem::with_id(app, "show", "Open Courage", true, None::<&str>)?;
+            let hide = MenuItem::with_id(
+                app,
+                "hide",
+                "Hide to tray (keep recording)",
+                true,
+                None::<&str>,
+            )?;
             let save = MenuItem::with_id(app, "save", "Save last replay", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Courage", true, None::<&str>)?;
-            let menu = MenuBuilder::new(app).items(&[&show, &save, &quit]).build()?;
+            let menu = MenuBuilder::new(app).items(&[&show, &hide, &save, &quit]).build()?;
             TrayIconBuilder::with_id("courage-tray")
                 .icon(app.default_window_icon().cloned().ok_or("Courage tray icon is missing")?)
                 .tooltip("Courage · replay buffer armed")
@@ -1606,34 +1849,26 @@ pub fn run() {
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
+                    "hide" => hide_to_tray(app.clone()),
                     "save" => {
-                        let result = {
-                            let state = app.state::<Mutex<AppState>>();
-                            state
-                                .lock()
-                                .ok()
-                                .and_then(|mut state| save_replay_inner(&mut state).ok())
-                        };
-                        if let Some(clip) = result {
-                            notify_clip_saved(app, &clip, "Tray action");
-                        }
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = save_replay(app.clone()).await {
+                                let _ = app.emit("capture-error", error);
+                            }
+                        });
                     }
-                    "quit" => {
-                        if let Ok(mut state) = app.state::<Mutex<AppState>>().lock() {
-                            let _ = stop_capture_inner(&mut state);
-                            stop_voice_listener(&mut state);
-                        }
-                        app.exit(0);
-                    }
+                    "quit" => request_exit(app),
                     _ => {}
                 })
                 .build(app)?;
+            start_supervisor(app.handle())?;
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                request_exit(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1641,21 +1876,33 @@ pub fn run() {
             get_settings,
             list_audio_devices,
             test_voice_phrase,
+            start_voice_test,
+            stop_voice_test,
             save_settings,
             start_capture,
             stop_capture,
             save_replay,
             list_clips,
             delete_clip,
-            open_path
+            open_path,
+            hide_to_tray,
+            quit_app
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running Courage");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if !app.state::<Arc<Control>>().exit_complete.load(Ordering::Acquire) {
+                api.prevent_exit();
+                request_exit(app);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_phrase, voice_would_trigger, SettingsFile};
+    use super::{normalize_phrase, SettingsFile};
 
     #[test]
     fn normalizes_voice_punctuation_and_case() {
@@ -1665,13 +1912,6 @@ mod tests {
     #[test]
     fn normalizes_unicode_letters() {
         assert_eq!(normalize_phrase("Écho — Café"), "écho café");
-    }
-
-    #[test]
-    fn wake_phrase_alone_requires_explicit_wake_only_mode() {
-        assert!(!voice_would_trigger("courage", "courage", "save that", false));
-        assert!(voice_would_trigger("courage", "courage", "save that", true));
-        assert!(voice_would_trigger("courage save that", "courage", "save that", false));
     }
 
     #[test]
@@ -1690,5 +1930,127 @@ mod tests {
         assert_eq!(settings.fps, 30);
         assert_eq!(settings.resolution_preset, "native");
         assert_eq!(settings.theme, "dark");
+    }
+
+    #[test]
+    fn concurrent_stop_requests_block_new_operations_until_all_finish() {
+        use super::*;
+        let control = Arc::new(Control::default());
+        let operation = Operation::acquire(&control).unwrap();
+        assert!(Operation::acquire(&control).is_err());
+        let first = StopRequest::new(&control);
+        let second = StopRequest::new(&control);
+        drop(operation);
+        drop(first);
+        assert!(Operation::acquire(&control).is_err());
+        drop(second);
+        assert!(Operation::acquire(&control).is_ok());
+        control.exiting.store(true, Ordering::Release);
+        assert!(Operation::acquire(&control).is_err());
+    }
+
+    #[test]
+    fn queued_start_cannot_resurrect_capture_after_a_later_stop_finishes() {
+        use super::*;
+        let control = Arc::new(Control::default());
+        let queued_epoch = control.stop_epoch.load(Ordering::Acquire);
+        let queued = Operation::acquire(&control).unwrap();
+        drop(StopRequest::new(&control)); // Stop wins the state mutex first.
+        assert_eq!(control.stops.load(Ordering::Acquire), 0);
+        assert!(control.prepare_start(queued_epoch).is_err());
+        assert!(control.stop_requested.load(Ordering::Acquire));
+        drop(queued);
+        let _fresh = Operation::acquire(&control).unwrap();
+        assert!(control.prepare_start(control.stop_epoch.load(Ordering::Acquire)).is_ok());
+        assert!(!control.stop_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[ignore = "requires installed ffmpeg/ffprobe; run cargo test -p courage-desktop real_ffmpeg -- --ignored --nocapture"]
+    fn real_ffmpeg_twenty_cycles_preserve_saved_clips() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!(
+            "courage-real-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis()
+        ));
+        let mut state = AppState::new(root.clone()).unwrap();
+        state.settings.voice_enabled = false;
+        state.settings.replay_seconds = 5;
+        let mut previous_sessions = std::collections::HashSet::new();
+        let mut saved = Vec::new();
+        for cycle in 0..20 {
+            let dir = new_session_dir(&root).unwrap();
+            assert!(previous_sessions.insert(dir.clone()));
+            let mut command = Command::new("ffmpeg");
+            command
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-stdin",
+                    "-progress",
+                    "pipe:1",
+                    "-stats_period",
+                    "0.1",
+                    "-re",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=10",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-g",
+                    "10",
+                    "-c:a",
+                    "aac",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    "1",
+                    "-reset_timestamps",
+                    "1",
+                ])
+                .arg(dir.join("segment-%05d.mp4"));
+            let mut owner = CaptureProcess::new(dir.clone());
+            owner
+                .start(&mut command, &state.control.stop_requested, Duration::from_secs(5))
+                .unwrap();
+            state.capture = Some(CaptureSession {
+                owner,
+                backend: "test lavfi".into(),
+                audio_enabled: true,
+                encoder: "libx264".into(),
+                fps: 10,
+                resolution: "64x64".into(),
+            });
+            if cycle >= 10 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while completed_segments(&dir, 5).unwrap().is_empty() {
+                    assert!(Instant::now() < deadline, "no closed segment in cycle {cycle}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let clip = save_replay_inner(&mut state).unwrap();
+                assert!(probe_duration_ms(Path::new(&clip.path)).unwrap() > 0);
+                saved.push(PathBuf::from(clip.path));
+            }
+            stop_capture_inner(&mut state).unwrap();
+            stop_capture_inner(&mut state).unwrap();
+            assert!(!dir.exists());
+            for clip in &saved {
+                assert!(clip.is_file());
+            }
+        }
+        assert_eq!(state.store.list_clips().unwrap().len(), 10);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 }

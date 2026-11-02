@@ -9,8 +9,9 @@ network calls.
 
 ## Current status
 
-The repository is being built in dependency order. The first vertical slice is
-implemented and verified:
+The first vertical slice is implemented. Automated Linux checks and Windows
+cross-compilation are recorded in `audit/test_results.md`; Windows hardware and
+installer acceptance remain separate from those checks:
 
 - bounded, byte-aware rolling video buffer;
 - FFmpeg-backed rolling desktop capture split into bounded one-second segments;
@@ -60,7 +61,9 @@ Install these prerequisites first:
   Windows 10/11 SDK;
 - Node.js 20+;
 - WebView2 Runtime;
-- FFmpeg on `PATH` for the CLI/media validation.
+- FFmpeg and FFprobe on `PATH` for capture, export and media validation;
+- Windows 10+ (Job Object process-list attributes) and Windows PowerShell 5.1 with
+  a matching installed System.Speech recognition language for voice commands.
 
 From the repository root:
 
@@ -108,8 +111,25 @@ folder** to choose another directory. Use **Settings → Recording microphone**
 to enumerate and select a connected input device; the selected FFmpeg device
 is persisted in the local Courage profile.
 
-Closing the window hides Courage in the tray rather than stopping it. The tray
-menu provides **Open Courage**, **Save last replay**, and **Quit Courage**.
+Closing the main window quits Courage after speech/capture cleanup. **Hide to tray**
+explicitly keeps it recording. Tray **Quit Courage** uses the same shutdown procedure.
+Cleanup errors keep the app open for retry and report the affected session/path.
+
+Voice Settings select an explicit recognition locale and constrained wake/command
+grammar. **Test text** uses the current draft; **Test microphone (no saves)** replaces
+the active voice trigger for up to 30 seconds and cannot save clips. Apply restores
+the saved trigger. See `audit/voice-recognition-investigation.md` for prerequisites
+and the real-microphone accuracy protocol.
+
+PID/session-scoped Windows lifecycle verification:
+
+```powershell
+powershell -NoProfile -File .\audit\benchmarks\test-windows-lifecycle.ps1 `
+  -Exe .\target\release\courage-desktop.exe -RunBackendTests -ConfirmMicrophoneRelease
+```
+
+This exercises 10 start/stop and 10 start/save/stop cycles plus Close while recording.
+It records process exit and session removal separately from observed microphone release.
 
 The one-command media gate is:
 
@@ -131,10 +151,12 @@ audio backends ──────────┘                         │
                                                Tauri commands / React UI
 ```
 
-Capture stays on its own producer path. Saving a clip copies a bounded
-snapshot and hands encoding to a worker; disk and FFmpeg work never holds the
-capture lock. The buffer is bounded both by frame count and bytes so a bad
-source cannot grow memory without limit.
+The core/CLI buffer is bounded by frame count and bytes. The desktop uses a bounded
+rolling set of FFmpeg segments; its backend serializes start, export and stop through
+one owner while FFmpeg records independently. Blocking commands run off the UI thread.
+On Windows, dedicated kill-on-close jobs own capture, speech, probes and exporters;
+normal shutdown first requests graceful termination and joins pipe readers before
+removing session files. Detailed ownership and bounds are in `audit/CODEBASE_REVIEW.md`.
 
 ## Project map
 

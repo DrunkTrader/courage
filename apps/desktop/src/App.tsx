@@ -46,11 +46,17 @@ type Settings = {
   voiceWakePhrase: string
   voiceCommandPhrase: string
   voiceWakeOnly: boolean
+  voiceLocale: string
   theme: Theme
 }
 
 type EngineStatus = {
-  state: 'ready' | 'capturing' | 'unavailable' | string
+  revision: number
+  state: 'stopped' | 'starting' | 'recording' | 'stopping' | 'error' | 'unavailable'
+  sessionId: string | null
+  pid: number | null
+  error: string | null
+  voice: VoiceDiagnostics
   platform: string
   backend: string
   audioDevice: string | null
@@ -64,8 +70,32 @@ type EngineStatus = {
 }
 
 type VoiceRecognitionResult = {
+  generation: string
   phrase: string
-  confidence: number
+  confidence: number | null
+  decision: VoiceDecision
+  testMode: boolean
+  saved: boolean
+}
+
+type VoiceDecision = {
+  normalized: string
+  wakeMatched: boolean
+  commandMatched: boolean
+  wouldTrigger: boolean
+  reason: string
+}
+
+type VoiceDiagnostics = {
+  generation: string | null
+  engine: string
+  locale: string
+  microphone: string
+  audioFormat: string | null
+  availability: string
+  listening: boolean
+  testMode: boolean
+  error: string | null
 }
 
 type IconName =
@@ -112,11 +142,17 @@ const emptySettings: Settings = {
   voiceWakePhrase: 'Courage',
   voiceCommandPhrase: 'have it',
   voiceWakeOnly: false,
+  voiceLocale: 'en-US',
   theme: 'dark',
 }
 
 const emptyStatus: EngineStatus = {
+  revision: 0,
   state: 'unavailable',
+  sessionId: null,
+  pid: null,
+  error: null,
+  voice: { generation: null, engine: 'System.Speech · constrained grammar', locale: 'en-US', microphone: 'Windows default recording device', audioFormat: null, availability: 'unchecked', listening: false, testMode: false, error: null },
   platform: 'browser preview',
   backend: 'Desktop runtime required',
   audioDevice: null,
@@ -144,10 +180,6 @@ const captureSettingKeys: Array<keyof Settings> = [
   'audioSampleRate',
   'audioChannels',
   'captureSource',
-  'voiceEnabled',
-  'voiceWakePhrase',
-  'voiceCommandPhrase',
-  'voiceWakeOnly',
 ]
 
 const isDesktop = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -177,9 +209,14 @@ export function App() {
   const [flash, setFlash] = useState<{ title: string; body: string } | null>(null)
   const [savingSettings, setSavingSettings] = useState(false)
   const [captureBusy, setCaptureBusy] = useState(false)
+  const [exiting, setExiting] = useState(false)
   const [libraryBusy, setLibraryBusy] = useState(false)
   const savingReplay = useRef(false)
+  const exitingRef = useRef(false)
   const lastHotkeyPress = useRef(0)
+  const acceptStatus = useCallback((next: EngineStatus) => {
+    if (!exitingRef.current) setStatus((current) => next.revision >= current.revision ? next : current)
+  }, [])
 
   const showFlash = useCallback((title: string, body: string) => {
     setFlash({ title, body })
@@ -211,6 +248,7 @@ export function App() {
   }, [fetchClips])
 
   const saveReplay = useCallback(async (trigger: 'button' | 'hotkey' | 'voice' = 'button') => {
+    if (exitingRef.current) return
     if (!isDesktop()) {
       setMessage('Run the Courage desktop build to capture the display.')
       return
@@ -273,6 +311,11 @@ export function App() {
       listen<VoiceRecognitionResult>('voice-result', (event) => {
         if (!disposed) setLastVoiceResult(event.payload)
       }),
+      listen<EngineStatus>('engine-status', (event) => {
+        if (!disposed) acceptStatus(event.payload)
+      }),
+      listen('app-exiting', () => { exitingRef.current = true; if (!disposed) { setExiting(true); setMessage('Closing Courage: releasing microphone and capture resources…') } }),
+      listen('app-exit-failed', () => { exitingRef.current = false; if (!disposed) setExiting(false) }),
     ])
 
     const boot = async () => {
@@ -289,8 +332,8 @@ export function App() {
         setClips(loadedClips)
         const nextStatus = await invoke<EngineStatus>('start_capture')
         if (disposed) return
-        setStatus(nextStatus)
-        setMessage(nextStatus.state === 'capturing' ? 'Replay buffer armed. Courage is ready.' : 'Replay buffer is ready.')
+        acceptStatus(nextStatus)
+        setMessage(nextStatus.state === 'recording' ? 'Replay buffer armed. Courage is ready.' : 'Replay buffer is ready.')
       } catch (error) {
         if (!disposed) {
           setStatus({ ...emptyStatus, backend: errorText(error) })
@@ -302,8 +345,9 @@ export function App() {
     }
     void boot()
     const statusTimer = window.setInterval(() => {
+      if (exitingRef.current) return
       void invoke<EngineStatus>('engine_status').then((nextStatus) => {
-        if (!disposed) setStatus(nextStatus)
+        if (!disposed) acceptStatus(nextStatus)
       }).catch(() => undefined)
     }, 2000)
     return () => {
@@ -311,7 +355,7 @@ export function App() {
       window.clearInterval(statusTimer)
       void listeners.then((unlisteners) => unlisteners.forEach((unlisten) => unlisten())).catch(() => undefined)
     }
-  }, [fetchClips, refreshClips, showFlash])
+  }, [acceptStatus, fetchClips, refreshClips, showFlash])
 
   useEffect(() => {
     if (!isDesktop() || !settings.hotkey) return
@@ -346,8 +390,8 @@ export function App() {
     return () => window.removeEventListener('keydown', preventBrowserActions)
   }, [])
 
-  const isRecording = status.state === 'capturing'
-  const voiceReady = settings.voiceEnabled && settings.nativeVoiceAvailable && status.voiceTrigger.includes('listening')
+  const isRecording = status.state === 'recording'
+  const voiceReady = settings.voiceEnabled && status.voice.listening && !status.voice.testMode
   const needsRestart = useMemo(
     () => captureSettingKeys.some((key) => settings[key] !== draft[key]),
     [draft, settings],
@@ -357,11 +401,11 @@ export function App() {
     if (captureBusy) return
     setCaptureBusy(true)
     try {
-      const nextStatus = isRecording
+      const nextStatus = isRecording || (status.state === 'error' && status.sessionId !== null)
         ? await invoke<EngineStatus>('stop_capture')
         : await invoke<EngineStatus>('start_capture')
-      setStatus(nextStatus)
-      setMessage(nextStatus.state === 'capturing' ? 'Replay buffer armed.' : 'Replay buffer stopped.')
+      acceptStatus(nextStatus)
+      setMessage(nextStatus.state === 'recording' ? 'Replay buffer armed.' : 'Replay buffer stopped.')
     } catch (error) {
       setMessage(`Capture could not change state: ${errorText(error)}`)
     } finally {
@@ -420,22 +464,24 @@ export function App() {
           voiceWakePhrase: draft.voiceWakePhrase,
           voiceCommandPhrase: draft.voiceCommandPhrase,
           voiceWakeOnly: draft.voiceWakeOnly,
+          voiceLocale: draft.voiceLocale,
           theme: draft.theme,
         },
       })
-      let nextStatus = status
-      if (restart) {
-        await invoke<EngineStatus>('stop_capture')
-        nextStatus = await invoke<EngineStatus>('start_capture')
-      }
       setSettings(nextSettings)
       setDraft(nextSettings)
       setTheme(nextSettings.theme)
-      setStatus(nextStatus)
+      let nextStatus = status
+      if (restart) {
+        nextStatus = await invoke<EngineStatus>('stop_capture')
+        acceptStatus(nextStatus)
+        nextStatus = await invoke<EngineStatus>('start_capture')
+      }
+      acceptStatus(nextStatus)
       await refreshClips()
       setMessage(restart ? 'Settings saved and the replay buffer restarted safely.' : 'Settings saved locally.')
     } catch (error) {
-      setMessage(`Settings were not applied: ${errorText(error)}`)
+      setMessage(`Settings or buffer update needs attention: ${errorText(error)}`)
     } finally {
       setSavingSettings(false)
     }
@@ -494,7 +540,8 @@ export function App() {
         </nav>
         <div className="sidebar-foot">
           <div className="local-pill"><span className="pulse-dot" />Local only</div>
-          <p>Runs quietly in the tray.<br />Your clips never leave this machine.</p>
+          <p>Close quits Courage.<br />Hide keeps recording in the tray.</p>
+          <button className="quiet-button" type="button" disabled={exiting} onClick={() => void invoke('hide_to_tray')}>Hide to tray</button>
           <small>{isRecording ? 'buffer armed' : 'buffer stopped'} · v0.1</small>
         </div>
       </aside>
@@ -505,7 +552,7 @@ export function App() {
             <span className="eyebrow">{view === 'library' ? 'Your moments' : view === 'capture' ? 'Capture desk' : 'Control room'}</span>
             <h1>{view === 'library' ? 'Library' : view === 'capture' ? 'Capture' : 'Settings'}</h1>
           </div>
-          <div className={`engine-state ${isRecording ? 'capturing' : status.state}`}><span />{isRecording ? 'Buffer armed' : 'Buffer stopped'}</div>
+          <div className={`engine-state ${isRecording ? 'capturing' : status.state}`}><span />{exiting ? 'Shutting down' : isRecording ? 'Buffer armed' : `Buffer ${status.state}`}</div>
         </header>
 
         {view === 'library' && (
@@ -523,15 +570,15 @@ export function App() {
             replaySeconds={settings.replaySeconds}
             hotkey={settings.hotkey}
             wakePhrase={settings.voiceWakePhrase}
-            commandPhrase={settings.voiceCommandPhrase}
+            commandPhrase={settings.voiceWakeOnly ? '' : settings.voiceCommandPhrase}
             onToggle={() => void toggleCapture()}
             onConfigure={() => setView('settings')}
             busy={libraryBusy}
             error={libraryError}
-            captureBusy={captureBusy}
+            captureBusy={captureBusy || exiting}
           />
         )}
-        {view === 'capture' && <CaptureView isRecording={isRecording} onToggle={() => void toggleCapture()} message={message} status={status} voiceReady={voiceReady} busy={captureBusy} />}
+        {view === 'capture' && <CaptureView isRecording={isRecording} onToggle={() => void toggleCapture()} message={message} status={status} voiceReady={voiceReady} busy={captureBusy || exiting} />}
         {view === 'settings' && (
           <SettingsView
             draft={draft}
@@ -545,10 +592,11 @@ export function App() {
             onRefreshDevices={() => void refreshDevices()}
             onApply={() => void applySettings()}
             onReset={resetSettings}
-            saving={savingSettings}
+            saving={savingSettings || captureBusy || exiting}
             needsRestart={needsRestart}
             message={message}
             lastVoiceResult={lastVoiceResult}
+            voice={status.voice}
           />
         )}
 
@@ -607,12 +655,31 @@ type SettingsViewProps = {
   needsRestart: boolean
   message: string
   lastVoiceResult: VoiceRecognitionResult | null
+  voice: VoiceDiagnostics
 }
 
-function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory, onRefreshDevices, onApply, onReset, saving, needsRestart, message, lastVoiceResult }: SettingsViewProps) {
+function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory, onRefreshDevices, onApply, onReset, saving, needsRestart, message, lastVoiceResult, voice }: SettingsViewProps) {
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft({ ...draft, [key]: value })
   const [voiceTest, setVoiceTest] = useState('Courage, have it')
   const [voiceResult, setVoiceResult] = useState<string | null>(null)
+  const [testingMic, setTestingMic] = useState(false)
+  const voiceConfig = { wakePhrase: draft.voiceWakePhrase, commandPhrase: draft.voiceCommandPhrase, wakeOnly: draft.voiceWakeOnly, locale: draft.voiceLocale }
+  const observation = lastVoiceResult?.generation === voice.generation ? lastVoiceResult : null
+
+  useEffect(() => {
+    setVoiceResult(null)
+    return () => { if (isDesktop()) void invoke('stop_voice_test').catch(() => undefined) }
+  }, [draft.voiceWakePhrase, draft.voiceCommandPhrase, draft.voiceWakeOnly, draft.voiceLocale])
+
+  async function testMicrophone() {
+    setTestingMic(true)
+    try {
+      if (voice.testMode && voice.listening) await invoke('stop_voice_test')
+      else await invoke('start_voice_test', { config: voiceConfig })
+    } catch (error) {
+      setVoiceResult(`Microphone test failed: ${errorText(error)}`)
+    } finally { setTestingMic(false) }
+  }
 
   async function testVoice() {
     if (!isDesktop()) {
@@ -620,8 +687,8 @@ function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory
       return
     }
     try {
-      const result = await invoke<{ normalized: string; wakeMatched: boolean; commandMatched: boolean; wouldTrigger: boolean }>('test_voice_phrase', { phrase: voiceTest })
-      setVoiceResult(`${result.wouldTrigger ? 'Would save' : 'Would not save'} · wake ${result.wakeMatched ? 'matched' : 'missed'} · command ${result.commandMatched ? 'matched' : 'missed'} · normalized “${result.normalized}”`)
+      const result = await invoke<VoiceDecision>('test_voice_phrase', { phrase: voiceTest, config: voiceConfig })
+      setVoiceResult(`Text simulation only · ${result.wouldTrigger ? 'matched' : 'rejected'} · wake ${result.wakeMatched ? 'matched' : 'missed'} · command ${result.commandMatched ? 'matched' : 'missed'} · ${result.reason}`)
     } catch (error) {
       setVoiceResult(`Test failed: ${errorText(error)}`)
     }
@@ -661,11 +728,20 @@ function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory
       <SettingsSection eyebrow="Voice trigger" title="Say it your way" description="The default requires both phrases: wake phrase, then command phrase. Wake-only is an explicit separate mode. Low-confidence Windows results are ignored.">
         <ToggleRow label="Enable native voice trigger" help={draft.nativeVoiceAvailable ? 'Windows Speech listens while the buffer is armed.' : 'Native tray recognition is available on Windows only.'} checked={draft.voiceEnabled} disabled={!draft.nativeVoiceAvailable} onChange={(checked) => update('voiceEnabled', checked)} />
         <div className="field-grid compact-grid">
-          <SettingField label="Wake phrase" help="Example: Courage"><input id="voice-wake" value={draft.voiceWakePhrase} onChange={(event) => update('voiceWakePhrase', event.target.value)} /></SettingField>
-          <SettingField label="Command phrase" help="Example: save that"><input id="voice-command" value={draft.voiceCommandPhrase} onChange={(event) => update('voiceCommandPhrase', event.target.value)} /></SettingField>
+          <SettingField label="Wake phrase" help="Example: Courage"><input id="voice-wake" autoComplete="off" spellCheck={false} maxLength={80} value={draft.voiceWakePhrase} onChange={(event) => update('voiceWakePhrase', event.target.value)} /></SettingField>
+          <SettingField label="Command phrase" help="Required in combined mode."><input id="voice-command" autoComplete="off" spellCheck={false} maxLength={80} value={draft.voiceCommandPhrase} onChange={(event) => update('voiceCommandPhrase', event.target.value)} /></SettingField>
+          <SettingField label="Recognition locale" help="Must match an installed Windows System.Speech recognizer, for example en-US or en-GB."><input id="voice-locale" autoComplete="off" spellCheck={false} maxLength={32} value={draft.voiceLocale} onChange={(event) => update('voiceLocale', event.target.value)} /></SettingField>
         </div>
         <ToggleRow label="Wake phrase alone saves" help="Off means both wake and command are required." checked={draft.voiceWakeOnly} disabled={!draft.voiceEnabled} onChange={(checked) => update('voiceWakeOnly', checked)} />
-        <div className="voice-test"><div className="setting-label"><strong>Test phrase matching</strong><small>Recognition matching is normalized for case, punctuation, and spacing. No audio or transcript is stored.</small></div><div className="input-with-action"><input aria-label="Voice phrase to test" value={voiceTest} onChange={(event) => setVoiceTest(event.target.value)} /><button className="small-button" type="button" onClick={() => void testVoice()}><Icon name="voice" size={13} />Test</button></div>{voiceResult && <output className="test-result">{voiceResult}</output>}<div className="voice-observation"><Icon name="voice" size={14} /><span>Last heard</span><strong>{lastVoiceResult?.phrase || 'No recognition result yet'}</strong>{lastVoiceResult && <small>{Math.round(lastVoiceResult.confidence * 100)}% confidence · transient diagnostic only</small>}</div></div>
+        <div className="voice-test">
+          <div className="setting-label"><strong>Test the current draft</strong><small>Text simulation does not test microphone accuracy. Microphone test replaces the active voice trigger for up to 30 seconds and cannot save clips. Apply settings to resume the saved trigger. Audio and transcripts are not written to disk.</small></div>
+          <div className="input-with-action"><input aria-label="Voice phrase to test" autoComplete="off" value={voiceTest} onChange={(event) => setVoiceTest(event.target.value)} /><button className="small-button" type="button" onClick={() => void testVoice()}>Test text</button></div>
+          <button className="small-button" type="button" disabled={testingMic || saving || !draft.nativeVoiceAvailable} onClick={() => void testMicrophone()}><Icon name="microphone" size={13} />{testingMic ? 'Updating microphone…' : voice.testMode && voice.listening ? 'Stop microphone test' : 'Test microphone (no saves)'}</button>
+          {voiceResult && <output className="test-result" aria-live="polite">{voiceResult}</output>}
+          <dl><dt>Engine</dt><dd>{voice.engine}</dd><dt>Locale</dt><dd>{voice.locale}</dd><dt>Speech microphone</dt><dd>{voice.microphone}</dd><dt>Input format</dt><dd>{voice.audioFormat || 'Not reported yet'}</dd><dt>Availability / listening</dt><dd>{voice.availability} / {voice.listening ? voice.testMode ? 'testing draft · no saves' : 'listening · saved grammar' : 'stopped'}</dd></dl>
+          {voice.error && <p role="alert">{voice.error}</p>}
+          <div className="voice-observation" aria-live="polite"><span>Last final result</span><strong>{observation?.phrase || 'No recognition result for this session'}</strong>{observation && <small>{observation.confidence === null ? 'Confidence unavailable' : `${Math.round(observation.confidence * 100)}% engine confidence (not an accuracy percentage)`} · wake {observation.decision.wakeMatched ? 'matched' : 'missed'} · command {observation.decision.commandMatched ? 'matched' : 'missed'} · {observation.saved ? 'clip saved' : 'no clip saved'} · {observation.decision.reason}</small>}</div>
+        </div>
       </SettingsSection>
 
       <SettingsSection eyebrow="Storage" title="Keep clips close" description="Courage reconciles this folder with its SQLite library whenever status is checked and after external changes.">

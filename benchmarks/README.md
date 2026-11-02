@@ -15,7 +15,7 @@ instead of inventing measurements.
 From the repository root:
 
 ```powershell
-pwsh -NoProfile -File .\audit\benchmarks\scripts\measure-windows.ps1 `
+pwsh -NoProfile -File .\benchmarks\scripts\measure-windows.ps1 `
   -Executable .\target\debug\courage-desktop.exe `
   -Iterations 5
 ```
@@ -25,16 +25,16 @@ Results are written to `audit/benchmarks/results/` as JSON and CSV. The harness
 records process startup, working set, CPU samples, process count, and the
 environment. Capture-specific fields are marked `not-run` unless the operator
 provides a capture scenario and confirms the resulting clip path.
-Because the normal Courage close action hides to the tray, the report explicitly
-labels whether the sample exited through a graceful window close or a forced
-process-tree stop. The forced mode uses `taskkill /T` so the FFmpeg child is not
-left running; do not treat a forced stop as shutdown latency.
+Normal Courage Close now coordinates a full shutdown; Hide to tray is explicit.
+The sampler still labels forced stops separately; do not treat forced stops as
+shutdown latency. For owned-PID, session-directory and microphone verification use
+[`../audit/benchmarks/test-windows-lifecycle.ps1`](../audit/benchmarks/test-windows-lifecycle.ps1).
 
 Use `manual-matrix.md` for the interactive Windows capture/library/voice/hotkey
 verification. Compare two process reports with:
 
 ```powershell
-pwsh -NoProfile -File .\audit\benchmarks\scripts\compare-windows.ps1 `
+pwsh -NoProfile -File .\benchmarks\scripts\compare-windows.ps1 `
   -Baseline .\audit\benchmarks\results\baseline.json `
   -PostFix .\audit\benchmarks\results\post-fix.json `
   -Output .\audit\benchmarks\results\comparison.json
