@@ -100,6 +100,19 @@ impl ClipStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
+
+    pub fn contains_path(&self, path: impl AsRef<Path>) -> Result<bool, StoreError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE path = ?1)",
+            [path.as_ref().to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn delete_clip(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self.connection.execute("DELETE FROM clips WHERE id = ?1", [id])? > 0)
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +129,8 @@ mod tests {
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].duration_ms, 1_250);
         assert_eq!(clips[0].thumbnail_path.as_deref(), Some(Path::new("target/example.jpg")));
+        assert!(store.contains_path("target/example.mp4").expect("contains"));
+        assert!(store.delete_clip(clips[0].id).expect("delete"));
+        assert!(!store.contains_path("target/example.mp4").expect("not contains"));
     }
 }

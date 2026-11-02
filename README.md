@@ -19,14 +19,16 @@ implemented and verified:
 - basic local trim/export command that produces a second playable MP4;
 - SQLite clip metadata store;
 - Tauri 2 desktop shell with a persistent system tray, global save hotkey,
-  native notifications, configurable microphone, and configurable clip folder.
+  native notifications, configurable capture settings, local themes, voice
+  phrase testing, and a reconciled clip library.
 
 The desktop runtime uses FFmpeg native input backends: Windows `gdigrab` plus
 DirectShow microphone devices, macOS `avfoundation`, and Linux X11 plus
 PulseAudio. Wayland PipeWire capture and per-GPU hardware encoder selection
 still require host verification. On Windows, the wake phrase runs through a
 native `System.Speech` listener that continues while the window is hidden in
-the tray.
+the tray. System.Speech uses the Windows default input device; the selected
+recording microphone is used by FFmpeg for saved clips.
 
 ## Quick start
 
@@ -76,6 +78,10 @@ application. To produce a Windows bundle, use:
 npm --prefix apps/desktop run desktop:build
 ```
 
+Windows verification and resource benchmark instructions are in
+[`benchmarks/README.md`](benchmarks/README.md). Hardware-dependent
+fields remain unreported until a real Windows run supplies the evidence.
+
 For the media validation gate without GNU Make:
 
 ```powershell
@@ -92,7 +98,8 @@ The Windows resource icon must exist at
 1. Start the desktop app with `npm --prefix apps/desktop run desktop`.
 2. Allow display and microphone access when Windows/WebView2 asks.
 3. Leave the replay buffer running while you play.
-4. Say **“Courage, have it”** or press the configured global hotkey.
+4. Say the configured wake and command phrases (by default **“Courage, have it”**)
+   or press the configured global hotkey.
 5. Look for the native clip-saved notification, then open Library or the clip folder.
 
 Clips default to the Tauri app-local data directory, normally
