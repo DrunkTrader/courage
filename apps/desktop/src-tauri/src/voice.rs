@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 pub const CONFIDENCE_THRESHOLD: f32 = 0.80;
 const RESULT_TTL: Duration = Duration::from_secs(2);
 const COOLDOWN: Duration = Duration::from_secs(2);
+const WAKE_WINDOW: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +51,7 @@ pub struct Decision {
 pub struct Matcher {
     last_id: u64,
     last_trigger: Option<Instant>,
+    wake_until: Option<Instant>,
 }
 
 impl Matcher {
@@ -63,11 +65,15 @@ impl Matcher {
         let normalized = normalize_phrase(&event.phrase);
         let wake = normalize_phrase(&config.wake_phrase);
         let command = normalize_phrase(&config.command_phrase);
+        if self.wake_until.is_some_and(|until| now > until) {
+            self.wake_until = None;
+        }
+        let waiting_for_command = self.wake_until.is_some();
+        let full_phrase = format!("{wake} {command}");
         let mut decision = Decision {
-            wake_matched: !wake.is_empty()
-                && (normalized == wake || normalized.starts_with(&(wake.clone() + " "))),
+            wake_matched: !wake.is_empty() && (normalized == wake || normalized == full_phrase),
             command_matched: !command.is_empty()
-                && (normalized == command || normalized.ends_with(&(" ".to_owned() + &command))),
+                && (normalized == command || normalized == full_phrase),
             normalized,
             would_trigger: false,
             reason: String::new(),
@@ -94,19 +100,36 @@ impl Matcher {
             .is_some_and(|value| value.is_finite() && (CONFIDENCE_THRESHOLD..=1.0).contains(&value))
         {
             "Low or unavailable confidence".into()
-        } else if decision.normalized
-            != if config.wake_only { wake } else { format!("{wake} {command}") }
-        {
-            "Complete configured phrase required".into()
         } else if self
             .last_trigger
             .is_some_and(|last| now.saturating_duration_since(last) < COOLDOWN)
         {
+            self.wake_until = None;
             "Trigger cooldown".into()
-        } else {
+        } else if config.wake_only {
+            if decision.wake_matched {
+                self.last_trigger = Some(now);
+                decision.would_trigger = true;
+                "Accepted wake phrase".into()
+            } else {
+                "Complete configured phrase required".into()
+            }
+        } else if decision.normalized == full_phrase {
+            self.wake_until = None;
             self.last_trigger = Some(now);
             decision.would_trigger = true;
             "Accepted final command".into()
+        } else if waiting_for_command && decision.command_matched {
+            self.wake_until = None;
+            decision.wake_matched = true;
+            self.last_trigger = Some(now);
+            decision.would_trigger = true;
+            "Accepted command after wake phrase".into()
+        } else if decision.wake_matched {
+            self.wake_until = Some(now + WAKE_WINDOW);
+            "Wake phrase accepted; waiting for command".into()
+        } else {
+            "Complete configured phrase required".into()
         };
         decision
     }
@@ -203,11 +226,11 @@ mod tests {
             ("handed him", false),
             ("Courage have it please", false),
         ] {
-            assert_eq!(
-                Matcher::default().decide(&config(), &event(phrase), now, now).would_trigger,
-                accepted,
-                "{phrase}"
-            );
+            let decision = Matcher::default().decide(&config(), &event(phrase), now, now);
+            assert_eq!(decision.would_trigger, accepted, "{phrase}");
+            if phrase == "Courage, HAVE it!" {
+                assert!(decision.wake_matched && decision.command_matched);
+            }
         }
         let mut config = config();
         config.command_phrase.clear();
@@ -259,5 +282,48 @@ mod tests {
             assert!(!decision.would_trigger);
             assert_eq!(decision.reason, message);
         }
+    }
+
+    #[test]
+    fn accepts_command_after_a_short_wake_pause() {
+        let now = Instant::now();
+        let mut matcher = Matcher::default();
+        let mut wake = event("Courage");
+        wake.id = 1;
+        let waiting = matcher.decide(&config(), &wake, now, now);
+        assert!(!waiting.would_trigger);
+        assert_eq!(waiting.reason, "Wake phrase accepted; waiting for command");
+
+        let mut command = event("have it");
+        command.id = 2;
+        let accepted = matcher.decide(
+            &config(),
+            &command,
+            now + Duration::from_millis(900),
+            now + Duration::from_millis(900),
+        );
+        assert!(accepted.would_trigger);
+        assert!(accepted.wake_matched && accepted.command_matched);
+        assert_eq!(accepted.reason, "Accepted command after wake phrase");
+    }
+
+    #[test]
+    fn expires_a_wake_without_triggering_a_late_command() {
+        let now = Instant::now();
+        let mut matcher = Matcher::default();
+        let mut wake = event("Courage");
+        wake.id = 1;
+        matcher.decide(&config(), &wake, now, now);
+
+        let mut command = event("have it");
+        command.id = 2;
+        let decision = matcher.decide(
+            &config(),
+            &command,
+            now + WAKE_WINDOW + Duration::from_millis(1),
+            now + WAKE_WINDOW + Duration::from_millis(1),
+        );
+        assert!(!decision.would_trigger);
+        assert_eq!(decision.reason, "Complete configured phrase required");
     }
 }

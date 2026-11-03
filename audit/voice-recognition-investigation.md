@@ -44,9 +44,10 @@ References: [System.Speech API](https://learn.microsoft.com/en-us/dotnet/api/sys
 - JSON configuration is sent over stdin; phrases are not interpolated into executable
   PowerShell. Culture selection fails explicitly and lists installed recognizer locales
   rather than silently using another language. Legacy settings default to `en-US`.
-- Combined grammar contains full phrase and isolated wake/command alternatives for
-  diagnostics; only exact normalized **full final** utterances trigger. Wake-only grammar
-  contains the wake phrase. No wake state is carried between utterances.
+- Combined grammar contains an ordered full phrase and isolated wake/command alternatives
+  for diagnostics. Exact normalized **full final** utterances trigger, and a command may
+  follow an isolated wake result within a bounded four-second window. Wake-only grammar
+  contains the wake phrase.
 - The Rust matcher is the single decision point. It rejects hypotheses, missing/non-finite
   or below-0.80 confidence, incorrect/partial phrases, duplicate/out-of-order result IDs,
   results older than two seconds, and commands within the two-second cooldown. Confidence
