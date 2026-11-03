@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { register, unregister } from '@tauri-apps/plugin-global-shortcut'
@@ -13,6 +13,8 @@ type Clip = {
   title: string
   durationMs: number
   createdAt: number
+  thumbnailPath: string | null
+  favorite: boolean
 }
 
 type AudioDevice = {
@@ -40,6 +42,8 @@ type Settings = {
   hardwareAcceleration: string
   cursorCapture: boolean
   audioEnabled: boolean
+  systemAudioEnabled: boolean
+  separateMicrophoneTrack: boolean
   audioSampleRate: number
   audioChannels: number
   captureSource: string
@@ -60,7 +64,6 @@ type EngineStatus = {
   platform: string
   backend: string
   audioDevice: string | null
-  voiceTrigger: string
   outputDir: string
   replaySeconds: number
   fps: number
@@ -110,7 +113,6 @@ type IconName =
   | 'microphone'
   | 'keyboard'
   | 'voice'
-  | 'palette'
   | 'chevron'
   | 'check'
   | 'monitor'
@@ -136,6 +138,8 @@ const emptySettings: Settings = {
   hardwareAcceleration: 'auto',
   cursorCapture: true,
   audioEnabled: true,
+  systemAudioEnabled: false,
+  separateMicrophoneTrack: false,
   audioSampleRate: 48000,
   audioChannels: 2,
   captureSource: 'desktop',
@@ -156,7 +160,6 @@ const emptyStatus: EngineStatus = {
   platform: 'browser preview',
   backend: 'Desktop runtime required',
   audioDevice: null,
-  voiceTrigger: 'Native desktop runtime required',
   outputDir: '',
   replaySeconds: 30,
   fps: 30,
@@ -177,6 +180,8 @@ const captureSettingKeys: Array<keyof Settings> = [
   'hardwareAcceleration',
   'cursorCapture',
   'audioEnabled',
+  'systemAudioEnabled',
+  'separateMicrophoneTrack',
   'audioSampleRate',
   'audioChannels',
   'captureSource',
@@ -205,6 +210,7 @@ export function App() {
   const [libraryError, setLibraryError] = useState<string | null>(null)
   const [lastVoiceResult, setLastVoiceResult] = useState<VoiceRecognitionResult | null>(null)
   const [selectedClip, setSelectedClip] = useState<Clip | null>(null)
+  const [favoritesOnly, setFavoritesOnly] = useState(false)
   const [message, setMessage] = useState('Starting the local capture engine…')
   const [flash, setFlash] = useState<{ title: string; body: string } | null>(null)
   const [savingSettings, setSavingSettings] = useState(false)
@@ -458,6 +464,8 @@ export function App() {
           hardwareAcceleration: draft.hardwareAcceleration,
           cursorCapture: draft.cursorCapture,
           audioEnabled: draft.audioEnabled,
+          systemAudioEnabled: draft.systemAudioEnabled,
+          separateMicrophoneTrack: draft.separateMicrophoneTrack,
           audioSampleRate: draft.audioSampleRate,
           audioChannels: draft.audioChannels,
           captureSource: draft.captureSource,
@@ -506,6 +514,33 @@ export function App() {
     } catch (error) {
       setMessage(`Could not open path: ${errorText(error)}`)
     }
+  }
+
+  async function copyPath(path: string) {
+    try {
+      await navigator.clipboard.writeText(path)
+      setMessage('Clip path copied to the clipboard.')
+    } catch (error) {
+      setMessage(`Could not copy clip path: ${errorText(error)}`)
+    }
+  }
+
+  async function toggleFavorite(clip: Clip) {
+    const favorite = !clip.favorite
+    try {
+      await invoke('set_clip_favorite', { id: clip.id, favorite })
+      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, favorite } : item))
+      setSelectedClip((current) => current?.id === clip.id ? { ...current, favorite } : current)
+    } catch (error) {
+      setMessage(`Could not update favorite: ${errorText(error)}`)
+    }
+  }
+
+  function handleTrimmed(clip: Clip) {
+    setClips((current) => [clip, ...current.filter((item) => item.id !== clip.id)])
+    setSelectedClip(clip)
+    setMessage(`Trimmed ${clip.title}.`)
+    showFlash('Trim saved', clip.path)
   }
 
   async function deleteClip(clip: Clip) {
@@ -563,7 +598,12 @@ export function App() {
             onSave={() => void saveReplay()}
             onOpen={(path) => void openPath(path)}
             onReveal={(path) => void openPath(path.replace(/[\\/][^\\/]+$/, ''))}
+            onCopyPath={(path) => void copyPath(path)}
             onDelete={(clip) => void deleteClip(clip)}
+            onFavorite={(clip) => void toggleFavorite(clip)}
+            onTrimmed={handleTrimmed}
+            favoritesOnly={favoritesOnly}
+            onFavoritesOnlyChange={setFavoritesOnly}
             onRefresh={() => void refreshClips()}
             isRecording={isRecording}
             voiceReady={voiceReady}
@@ -578,7 +618,7 @@ export function App() {
             captureBusy={captureBusy || exiting}
           />
         )}
-        {view === 'capture' && <CaptureView isRecording={isRecording} onToggle={() => void toggleCapture()} message={message} status={status} voiceReady={voiceReady} busy={captureBusy || exiting} />}
+         {view === 'capture' && <CaptureView isRecording={isRecording} onToggle={() => void toggleCapture()} message={message} status={status} voiceReady={voiceReady} busy={captureBusy || exiting} />}
         {view === 'settings' && (
           <SettingsView
             draft={draft}
@@ -597,6 +637,7 @@ export function App() {
             message={message}
             lastVoiceResult={lastVoiceResult}
             voice={status.voice}
+            platform={status.platform}
           />
         )}
 
@@ -614,7 +655,12 @@ type LibraryProps = {
   onSave: () => void
   onOpen: (path: string) => void
   onReveal: (path: string) => void
+  onCopyPath: (path: string) => void
   onDelete: (clip: Clip) => void
+  onFavorite: (clip: Clip) => void
+  onTrimmed: (clip: Clip) => void
+  favoritesOnly: boolean
+  onFavoritesOnlyChange: (value: boolean) => void
   onRefresh: () => void
   isRecording: boolean
   voiceReady: boolean
@@ -629,15 +675,16 @@ type LibraryProps = {
   captureBusy: boolean
 }
 
-function LibraryView({ clips, selectedClip, onSelect, onSave, onOpen, onReveal, onDelete, onRefresh, isRecording, voiceReady, replaySeconds, hotkey, wakePhrase, commandPhrase, onToggle, onConfigure, busy, error, captureBusy }: LibraryProps) {
+function LibraryView({ clips, selectedClip, onSelect, onSave, onOpen, onReveal, onCopyPath, onDelete, onFavorite, onTrimmed, favoritesOnly, onFavoritesOnlyChange, onRefresh, isRecording, voiceReady, replaySeconds, hotkey, wakePhrase, commandPhrase, onToggle, onConfigure, busy, error, captureBusy }: LibraryProps) {
+  const visibleClips = favoritesOnly ? clips.filter((clip) => clip.favorite) : clips
   return (
     <div className="content-grid">
       <section className="hero-panel">
         <div className="hero-copy"><span className="eyebrow warm">Instant replay</span><h2>Save what just<br /><em>happened.</em></h2><p>{voiceReady ? `Say “${wakePhrase}, ${commandPhrase}” to save without bringing Courage forward.` : `Courage keeps the last ${replaySeconds} seconds local and ready.`}</p><div className="hero-actions"><button className="primary-button" type="button" onClick={onSave}><Icon name="save" size={15} />Save last {replaySeconds}s <kbd>{prettyShortcut(hotkey)}</kbd></button><button className="quiet-button" type="button" onClick={onConfigure}>Configure <Icon name="chevron" size={13} /></button></div></div><div className="hero-orbit" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="orbit-core">{replaySeconds}<span>s</span></div></div>
       </section>
       <section className="quick-panel"><div className="section-heading"><span>Capture state</span><span className={`signal ${isRecording ? 'on' : ''}`}><span />{captureBusy ? 'Changing' : isRecording ? 'Armed' : 'Stopped'}</span></div><div className="record-control"><div className={`record-ring ${isRecording ? 'active' : ''}`}><button type="button" disabled={captureBusy} aria-label={isRecording ? 'Stop replay buffer' : 'Start replay buffer'} onClick={onToggle}><span /></button></div></div><strong>{captureBusy ? 'Changing capture state…' : isRecording ? 'Replay buffer is live' : 'Replay buffer is stopped'}</strong><p>{voiceReady ? 'Listening for the configured phrase in the tray.' : 'Start the buffer before saving a replay.'}</p><button className="outline-button" type="button" disabled={captureBusy} onClick={onToggle}>{captureBusy ? 'Working…' : isRecording ? 'Stop buffer' : 'Start buffer'}</button></section>
-      <section className="library-section"><div className="section-heading library-heading"><div><span className="eyebrow">Local library</span><h3>Recent captures</h3></div><div className="library-tools"><span className="library-count">{clips.length} {clips.length === 1 ? 'clip' : 'clips'}</span><button className="icon-button" type="button" onClick={onRefresh} disabled={busy} aria-label="Refresh library" title="Refresh library"><Icon name="refresh" size={15} /></button></div></div>{error ? <div className="state-panel error-state"><Icon name="info" size={20} /><strong>Clip folder unavailable</strong><p>{error}</p><button className="outline-button" type="button" onClick={onRefresh}><Icon name="refresh" size={14} />Try again</button></div> : busy && clips.length === 0 ? <div className="state-panel"><Icon name="refresh" size={20} /><strong>Checking the clip folder…</strong></div> : clips.length === 0 ? <EmptyLibrary onSave={onSave} /> : <div className="clip-grid">{clips.map((clip) => <ClipCard key={clip.id} clip={clip} selected={selectedClip?.id === clip.id} onSelect={onSelect} onOpen={onOpen} onReveal={onReveal} onDelete={onDelete} />)}</div>}</section>
-      {selectedClip && <ClipInspector clip={selectedClip} onClose={() => onSelect(null)} onOpen={onOpen} onReveal={onReveal} onDelete={onDelete} />}
+       <section className="library-section"><div className="section-heading library-heading"><div><span className="eyebrow">Local library</span><h3>Recent captures</h3></div><div className="library-tools"><span className="library-count">{visibleClips.length} {visibleClips.length === 1 ? 'clip' : 'clips'}</span><button className={`icon-button ${favoritesOnly ? 'selected' : ''}`} type="button" onClick={() => onFavoritesOnlyChange(!favoritesOnly)} aria-pressed={favoritesOnly} aria-label={favoritesOnly ? 'Show all clips' : 'Show favorite clips'} title={favoritesOnly ? 'Show all clips' : 'Show favorite clips'}>★</button><button className="icon-button" type="button" onClick={onRefresh} disabled={busy} aria-label="Refresh library" title="Refresh library"><Icon name="refresh" size={15} /></button></div></div>{error ? <div className="state-panel error-state"><Icon name="info" size={20} /><strong>Clip folder unavailable</strong><p>{error}</p><button className="outline-button" type="button" onClick={onRefresh}><Icon name="refresh" size={14} />Try again</button></div> : busy && clips.length === 0 ? <div className="state-panel"><Icon name="refresh" size={20} /><strong>Checking the clip folder…</strong></div> : visibleClips.length === 0 && clips.length === 0 ? <EmptyLibrary onSave={onSave} /> : visibleClips.length === 0 ? <div className="state-panel"><strong>No favorite clips yet</strong><button className="outline-button" type="button" onClick={() => onFavoritesOnlyChange(false)}>Show all clips</button></div> : <div className="clip-grid">{visibleClips.map((clip) => <ClipCard key={clip.id} clip={clip} selected={selectedClip?.id === clip.id} onSelect={onSelect} onOpen={onOpen} onReveal={onReveal} onCopyPath={onCopyPath} onDelete={onDelete} onFavorite={onFavorite} />)}</div>}</section>
+       {selectedClip && <ClipInspector clip={selectedClip} onClose={() => onSelect(null)} onOpen={onOpen} onReveal={onReveal} onCopyPath={onCopyPath} onDelete={onDelete} onTrimmed={onTrimmed} />}
     </div>
   )
 }
@@ -656,9 +703,10 @@ type SettingsViewProps = {
   message: string
   lastVoiceResult: VoiceRecognitionResult | null
   voice: VoiceDiagnostics
+  platform: string
 }
 
-function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory, onRefreshDevices, onApply, onReset, saving, needsRestart, message, lastVoiceResult, voice }: SettingsViewProps) {
+function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory, onRefreshDevices, onApply, onReset, saving, needsRestart, message, lastVoiceResult, voice, platform }: SettingsViewProps) {
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft({ ...draft, [key]: value })
   const [voiceTest, setVoiceTest] = useState('Courage, have it')
   const [voiceResult, setVoiceResult] = useState<string | null>(null)
@@ -712,8 +760,10 @@ function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory
         <ToggleRow label="Capture cursor" help="Draw the pointer into the desktop frames." checked={draft.cursorCapture} onChange={(checked) => update('cursorCapture', checked)} />
       </SettingsSection>
 
-      <SettingsSection eyebrow="Audio input" title="Sound that belongs with the moment" description="The selected device is passed to FFmpeg. Native Windows speech uses the OS default input device.">
-        <ToggleRow label="Record microphone audio" help="Disable this for video-only capture." checked={draft.audioEnabled} onChange={(checked) => update('audioEnabled', checked)} />
+       <SettingsSection eyebrow="Audio input" title="Sound that belongs with the moment" description="The selected device is passed to FFmpeg. Native Windows speech uses the OS default input device.">
+           <ToggleRow label="Record microphone audio" help="Disable this for video-only capture." checked={draft.audioEnabled} onChange={(checked) => update('audioEnabled', checked)} />
+           <ToggleRow label="Capture system audio" help={platform === 'macos' ? 'System audio capture is not connected on macOS yet.' : 'Capture the default playback device alongside the microphone.'} checked={draft.systemAudioEnabled} disabled={platform === 'macos'} onChange={(checked) => update('systemAudioEnabled', checked)} />
+           <ToggleRow label="Keep a separate microphone track" help="Adds the microphone as a second track when system audio is also captured." checked={draft.separateMicrophoneTrack} disabled={!draft.audioEnabled || !draft.systemAudioEnabled} onChange={(checked) => update('separateMicrophoneTrack', checked)} />
         <div className="field-grid compact-grid">
           <SettingField label="Recording microphone" help={draft.audioDevices.length ? 'Used for clip audio.' : 'No devices were discovered.'}><div className="input-with-action"><select id="audio-device" value={draft.selectedAudioDevice ?? ''} disabled={!draft.audioEnabled} onChange={(event) => update('selectedAudioDevice', event.target.value || null)}><option value="">No microphone</option>{draft.audioDevices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.isDefault ? ' · default' : ''}</option>)}</select><button className="small-button" type="button" onClick={onRefreshDevices}><Icon name="refresh" size={13} />Refresh</button></div></SettingField>
           <SettingField label="Sample rate" help="Resampled for stable A/V sync."><select id="audio-sample-rate" disabled={!draft.audioEnabled} value={draft.audioSampleRate} onChange={(event) => update('audioSampleRate', Number(event.target.value))}><option value="44100">44.1 kHz</option><option value="48000">48 kHz</option></select></SettingField>
@@ -805,16 +855,44 @@ function CaptureView({ isRecording, onToggle, message, status, voiceReady, busy 
   return <section className="detail-view"><div className="detail-header"><span className="eyebrow warm">Capture status</span><h2>{busy ? 'Changing the buffer.' : isRecording ? 'The buffer is live.' : 'Arm the buffer before you play.'}</h2><p>{message}</p></div><div className="capture-card"><div className={`big-record-indicator ${isRecording ? 'active' : ''}`} /><div><strong>{busy ? 'Waiting for FFmpeg to finish changing state' : isRecording ? 'Capturing the desktop now' : 'Capture is stopped'}</strong><p>{isRecording ? `${voiceReady ? 'Listening for the configured voice phrase. ' : ''}Saved clips go to ${status.outputDir}.` : 'No frames are recorded until you start the buffer.'}</p></div><button className="primary-button" type="button" disabled={busy} onClick={onToggle}>{busy ? 'Working…' : isRecording ? 'Stop buffer' : 'Start buffer'}</button></div><div className="info-grid"><InfoBlock title="Video source" value={`${status.resolution} · ${status.fps} FPS`} icon="monitor" /><InfoBlock title="Encoder" value={status.videoEncoder} icon="capture" /><InfoBlock title="Audio input" value={status.audioDevice || 'Video only'} icon="audio" /><InfoBlock title="Cursor" value={status.cursorCapture ? 'Included' : 'Hidden'} icon="cursor" /><InfoBlock title="Replay length" value={`${status.replaySeconds}s`} icon="save" /><InfoBlock title="Output folder" value={status.outputDir || 'Not configured'} icon="folder" /></div></section>
 }
 
-function LibraryViewEmptyAction({ onSave }: { onSave: () => void }) { return <button className="outline-button" type="button" onClick={onSave}><Icon name="save" size={14} />Save a replay</button> }
+function EmptyLibrary({ onSave }: { onSave: () => void }) { return <div className="empty-library"><div className="empty-mark"><Icon name="library" size={18} /></div><strong>No captures yet</strong><p>Start the buffer, play normally, then save with the hotkey or configured voice phrase.</p><button className="outline-button" type="button" onClick={onSave}><Icon name="save" size={14} />Save a replay</button></div> }
 
-function EmptyLibrary({ onSave }: { onSave: () => void }) { return <div className="empty-library"><div className="empty-mark"><Icon name="library" size={18} /></div><strong>No captures yet</strong><p>Start the buffer, play normally, then save with the hotkey or configured voice phrase.</p><LibraryViewEmptyAction onSave={onSave} /></div> }
-
-function ClipCard({ clip, selected, onSelect, onOpen, onReveal, onDelete }: { clip: Clip; selected: boolean; onSelect: (clip: Clip) => void; onOpen: (path: string) => void; onReveal: (path: string) => void; onDelete: (clip: Clip) => void }) {
-  return <article className={`clip-card ${selected ? 'selected' : ''}`}><button className="clip-thumb real" type="button" onClick={() => onSelect(clip)} aria-label={`Inspect ${clip.title}`}><span className="thumb-grid" aria-hidden="true" /><span className="play-icon"><Icon name="play" size={15} /></span><span className="clip-duration">{formatDuration(clip.durationMs)}</span></button><div className="clip-info"><strong title={clip.title}>{clip.title}</strong><span title={clip.path}>{new Date(clip.createdAt * 1000).toLocaleString()}</span><div className="clip-actions"><button className="open-clip" type="button" onClick={() => onOpen(clip.path)}><Icon name="play" size={12} />Open</button><button className="open-clip" type="button" onClick={() => onReveal(clip.path)}><Icon name="folder" size={12} />Folder</button><button className="danger-button" type="button" onClick={() => onDelete(clip)} aria-label={`Delete ${clip.title}`}><Icon name="trash" size={13} /></button></div></div></article>
+function ClipCard({ clip, selected, onSelect, onOpen, onReveal, onCopyPath, onDelete, onFavorite }: { clip: Clip; selected: boolean; onSelect: (clip: Clip) => void; onOpen: (path: string) => void; onReveal: (path: string) => void; onCopyPath: (path: string) => void; onDelete: (clip: Clip) => void; onFavorite: (clip: Clip) => void }) {
+  const thumbnail = clip.thumbnailPath && isDesktop() ? convertFileSrc(clip.thumbnailPath) : undefined
+  return <article className={`clip-card ${selected ? 'selected' : ''}`}><button className="clip-thumb real" type="button" onClick={() => onSelect(clip)} aria-label={`Inspect ${clip.title}`}>{thumbnail ? <img src={thumbnail} alt="" aria-hidden="true" /> : <span className="thumb-grid" aria-hidden="true" />}<span className="play-icon"><Icon name="play" size={15} /></span><span className="clip-duration">{formatDuration(clip.durationMs)}</span></button><div className="clip-info"><strong title={clip.title}>{clip.title}</strong><span title={clip.path}>{new Date(clip.createdAt * 1000).toLocaleString()}</span><div className="clip-actions"><button className="open-clip" type="button" onClick={() => onOpen(clip.path)}><Icon name="play" size={12} />Open</button><button className="open-clip" type="button" onClick={() => onCopyPath(clip.path)}>Copy path</button><button className="open-clip" type="button" onClick={() => onReveal(clip.path)}><Icon name="folder" size={12} />Folder</button><button className="favorite-button" type="button" aria-label={clip.favorite ? `Unfavorite ${clip.title}` : `Favorite ${clip.title}`} aria-pressed={clip.favorite} onClick={() => onFavorite(clip)}>★</button><button className="danger-button" type="button" onClick={() => onDelete(clip)} aria-label={`Delete ${clip.title}`}><Icon name="trash" size={13} /></button></div></div></article>
 }
 
-function ClipInspector({ clip, onClose, onOpen, onReveal, onDelete }: { clip: Clip; onClose: () => void; onOpen: (path: string) => void; onReveal: (path: string) => void; onDelete: (clip: Clip) => void }) {
-  return <div className="clip-player" role="dialog" aria-modal="true" aria-labelledby="clip-inspector-title"><div className="player-heading"><div><span className="eyebrow">Selected capture</span><strong id="clip-inspector-title">{clip.title}</strong></div><button className="quiet-button" type="button" onClick={onClose}>Close</button></div><p className="clip-path">{clip.path}</p><div className="inspector-meta"><span>{formatDuration(clip.durationMs)}</span><span>{new Date(clip.createdAt * 1000).toLocaleString()}</span><span>MP4 video</span></div><div className="inspector-actions"><button className="primary-button" type="button" onClick={() => onOpen(clip.path)}><Icon name="play" size={14} />Open clip</button><button className="outline-button" type="button" onClick={() => onReveal(clip.path)}><Icon name="folder" size={14} />Reveal folder</button><button className="danger-button" type="button" onClick={() => onDelete(clip)}><Icon name="trash" size={14} />Delete</button></div></div>
+function ClipInspector({ clip, onClose, onOpen, onReveal, onCopyPath, onDelete, onTrimmed }: { clip: Clip; onClose: () => void; onOpen: (path: string) => void; onReveal: (path: string) => void; onCopyPath: (path: string) => void; onDelete: (clip: Clip) => void; onTrimmed: (clip: Clip) => void }) {
+  const [start, setStart] = useState(0)
+  const [end, setEnd] = useState(Math.max(0.1, clip.durationMs / 1000))
+  const [trimming, setTrimming] = useState(false)
+  const [trimError, setTrimError] = useState<string | null>(null)
+  const source = isDesktop() ? convertFileSrc(clip.path) : undefined
+
+  useEffect(() => {
+    setStart(0)
+    setEnd(Math.max(0.1, clip.durationMs / 1000))
+    setTrimError(null)
+  }, [clip.id, clip.durationMs])
+
+  async function trimClip() {
+    if (start < 0 || end <= start) {
+      setTrimError('End must be greater than start.')
+      return
+    }
+    setTrimming(true)
+    setTrimError(null)
+    try {
+      const trimmed = await invoke<Clip>('trim_clip', { id: clip.id, startSeconds: start, endSeconds: end })
+      onTrimmed(trimmed)
+    } catch (error) {
+      setTrimError(errorText(error))
+    } finally {
+      setTrimming(false)
+    }
+  }
+
+  return <div className="clip-player" role="dialog" aria-modal="true" aria-labelledby="clip-inspector-title"><div className="player-heading"><div><span className="eyebrow">Selected capture</span><strong id="clip-inspector-title">{clip.title}</strong></div><button className="quiet-button" type="button" onClick={onClose}>Close</button></div>{source ? <video className="clip-video" controls preload="metadata" src={source} aria-label={`Preview ${clip.title}`} /> : <div className="state-panel"><strong>Preview available in the desktop build</strong></div>}<p className="clip-path">{clip.path}</p><div className="inspector-meta"><span>{formatDuration(clip.durationMs)}</span><span>{new Date(clip.createdAt * 1000).toLocaleString()}</span><span>MP4 video</span></div><div className="trim-controls"><label htmlFor="trim-start">Start (seconds)<input id="trim-start" type="number" min="0" max={Math.max(0.1, clip.durationMs / 1000)} step="0.1" value={start} onChange={(event) => setStart(Number(event.target.value))} /></label><label htmlFor="trim-end">End (seconds)<input id="trim-end" type="number" min="0.1" max={Math.max(0.1, clip.durationMs / 1000)} step="0.1" value={end} onChange={(event) => setEnd(Number(event.target.value))} /></label><button className="outline-button" type="button" disabled={trimming} onClick={() => void trimClip()}>{trimming ? 'Trimming…' : 'Save trimmed copy'}</button></div>{trimError && <p className="trim-error" role="alert">{trimError}</p>}<div className="inspector-actions"><button className="primary-button" type="button" onClick={() => onOpen(clip.path)}><Icon name="play" size={14} />Open clip</button><button className="outline-button" type="button" onClick={() => onCopyPath(clip.path)}>Copy path</button><button className="outline-button" type="button" onClick={() => onReveal(clip.path)}><Icon name="folder" size={14} />Reveal folder</button><button className="danger-button" type="button" onClick={() => onDelete(clip)}><Icon name="trash" size={14} />Delete</button></div></div>
 }
 
 function InfoBlock({ title, value, icon }: { title: string; value: string; icon: IconName }) { return <div className="info-block"><span><Icon name={icon} size={13} />{title}</span><strong title={value}>{value}</strong></div> }
@@ -837,7 +915,6 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
     microphone: <><rect x="8" y="3" width="8" height="12" rx="4" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8" /></>,
     keyboard: <><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10" /></>,
     voice: <><path d="M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3Z" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6" /></>,
-    palette: <><path d="M12 3a9 9 0 0 0 0 18h1.2a1.8 1.8 0 0 0 1.2-3.1 1.8 1.8 0 0 1 1.2-3.1H18a3 3 0 0 0 3-3A8.8 8.8 0 0 0 12 3Z" /><circle cx="7.5" cy="10" r=".7" fill="currentColor" /><circle cx="9" cy="7" r=".7" fill="currentColor" /><circle cx="13" cy="6.5" r=".7" fill="currentColor" /><circle cx="16" cy="8" r=".7" fill="currentColor" /></>,
     chevron: <path d="m9 6 6 6-6 6" />,
     check: <path d="m5 12 4 4L19 6" />,
     monitor: <><rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 21h8M12 17v4" /></>,

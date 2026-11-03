@@ -6,9 +6,9 @@ verified on each target OS.
 
 | Platform | Candidate video API | Candidate audio API | Required verification |
 | --- | --- | --- | --- |
-| Windows 10/11 | FFmpeg `gdigrab` | FFmpeg DirectShow selected input | Display permission, microphone device enumeration, protected content behavior, DWM scaling. |
-| Linux | FFmpeg X11 capture; PipeWire portal remains planned | PulseAudio default source | X11 display, multi-monitor, fractional scaling, suspend/resume. |
-| macOS | ScreenCaptureKit | Core Audio / AudioUnit | Screen Recording and microphone consent, display changes, sleep/wake. |
+| Windows 10/11 | FFmpeg `gdigrab` | FFmpeg DirectShow selected input plus WASAPI default playback | Display permission, microphone/system-audio enumeration, protected content behavior, DWM scaling. |
+| Linux | FFmpeg X11 capture; PipeWire portal remains planned | PulseAudio selected input plus default sink monitor | X11 display, multi-monitor, fractional scaling, suspend/resume, monitor availability. |
+| macOS | ScreenCaptureKit | Core Audio / AudioUnit; system audio remains planned | Screen Recording and microphone consent, display changes, sleep/wake. |
 
 Every backend must report: supported sources, pixel format, timestamps,
 permissions, hardware encoder candidates, and a recoverable error when no
@@ -21,9 +21,10 @@ The Tauri desktop starts FFmpeg as a child process and writes one-second MP4
 segments into the app-local `rolling-buffer` directory. The directory is
 bounded by FFmpeg's segment wrap count. Saving a replay concatenates only
 completed segments, writes an atomic output MP4 into the local `clips`
-directory (or the user-selected clip directory), and inserts its path and
-duration into SQLite. The capture process continues while the save operation
-runs.
+directory (or the user-selected clip directory), generates a sidecar thumbnail
+when FFmpeg can decode the clip, and inserts its path, duration, thumbnail, and
+favorite metadata into SQLite. The capture process continues while the save
+operation runs.
 
 On Windows, the wake phrase is handled by a native `System.Speech` child
 listener. It remains alive after the main window is hidden in the tray and

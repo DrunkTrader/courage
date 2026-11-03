@@ -422,7 +422,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-global-shortcut",
  "tauri-winrt-notification",
- "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
 
