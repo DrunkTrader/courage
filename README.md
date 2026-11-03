@@ -16,17 +16,18 @@ installer acceptance remain separate from those checks:
 - bounded, byte-aware rolling video buffer;
 - FFmpeg-backed rolling desktop capture split into bounded one-second segments;
 - non-blocking replay save boundary that never pauses the capture process;
-- local MP4 export with a user-selected microphone;
-- basic local trim/export command that produces a second playable MP4;
-- SQLite clip metadata store;
+- local MP4 export with optional system audio, a user-selected microphone, and an opt-in separate microphone track;
+- in-app video preview, generated thumbnails, favorite filtering, copy-path handoff, and single-range trimmed copies;
+- SQLite clip metadata store with thumbnail and favorite migration;
 - Tauri 2 desktop shell with a persistent system tray, global save hotkey,
   native notifications, configurable capture settings, local themes, voice
   phrase testing, and a reconciled clip library.
 
 The desktop runtime uses FFmpeg native input backends: Windows `gdigrab` plus
-DirectShow microphone devices, macOS `avfoundation`, and Linux X11 plus
-PulseAudio. Wayland PipeWire capture and per-GPU hardware encoder selection
-still require host verification. On Windows, the wake phrase runs through a
+DirectShow microphone and WASAPI system-audio inputs, macOS `avfoundation`, and
+Linux X11 plus PulseAudio (including the default sink monitor for system audio).
+Wayland PipeWire capture, macOS system audio, and per-GPU hardware encoder
+selection still require host verification. On Windows, the wake phrase runs through a
 native `System.Speech` listener that continues while the window is hidden in
 the tray. System.Speech uses the Windows default input device; the selected
 recording microphone is used by FFmpeg for saved clips.
@@ -100,10 +101,13 @@ The Windows resource icon must exist at
 
 1. Start the desktop app with `npm --prefix apps/desktop run desktop`.
 2. Allow display and microphone access when Windows/WebView2 asks.
-3. Leave the replay buffer running while you play.
+3. Leave the replay buffer running while you play. Enable system audio and/or
+   the separate microphone track in **Settings → Audio input** when needed.
 4. Say the configured wake and command phrases (by default **“Courage, have it”**)
    or press the configured global hotkey.
-5. Look for the native clip-saved notification, then open Library or the clip folder.
+5. Look for the native clip-saved notification, then open Library. Select a
+   clip to preview it, copy its path, favorite it, or save a trimmed copy; the
+   original file remains in place.
 
 Clips default to the Tauri app-local data directory, normally
 `%LOCALAPPDATA%\dev.courage.recorder\clips\` on Windows. Use **Settings → Clip
@@ -141,7 +145,7 @@ make media-validation
 
 ```text
 native capture backends ─┐
-                         ├─> CaptureSource ─> bounded rolling buffer
+                          ├─> bounded rolling buffer
 audio backends ──────────┘                         │
                                                   ├─> snapshot job
                                                   └─> FFmpeg exporter ─> MP4

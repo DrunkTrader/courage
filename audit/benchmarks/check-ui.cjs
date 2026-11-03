@@ -18,15 +18,18 @@ const server = spawn('python3', ['-m', 'http.server', '1421', '--bind', '127.0.0
       window.calls = []
       let id = 0
       const voice = { generation: null, engine: 'System.Speech · constrained grammar', locale: 'en-US', microphone: 'Windows default recording device', audioFormat: null, availability: 'unchecked', listening: false, testMode: false, error: null }
-      const settings = { outputDir: 'C:\\Clips', defaultOutputDir: 'C:\\Clips', audioDevices: [], selectedAudioDevice: null, hotkey: 'Control+Shift+1', replaySeconds: 30, voiceEnabled: true, nativeVoiceAvailable: true, fps: 30, resolutionPreset: 'native', width: null, height: null, videoQuality: 'balanced', videoEncoder: 'auto', hardwareAcceleration: 'auto', cursorCapture: true, audioEnabled: false, audioSampleRate: 48000, audioChannels: 2, captureSource: 'desktop', voiceWakePhrase: 'Courage', voiceCommandPhrase: 'have it', voiceWakeOnly: false, voiceLocale: 'en-US', theme: 'dark' }
-      const status = { revision: 1, state: 'recording', sessionId: 'fixture-session', pid: 123, error: null, voice, platform: 'UI fixture', backend: 'fixture only', audioDevice: null, voiceTrigger: 'waiting', outputDir: settings.outputDir, replaySeconds: 30, fps: 30, resolution: 'Native display', videoEncoder: 'libx264', cursorCapture: true }
+      const settings = { outputDir: 'C:\\Clips', defaultOutputDir: 'C:\\Clips', audioDevices: [], selectedAudioDevice: null, hotkey: 'Control+Shift+1', replaySeconds: 30, voiceEnabled: true, nativeVoiceAvailable: true, fps: 30, resolutionPreset: 'native', width: null, height: null, videoQuality: 'balanced', videoEncoder: 'auto', hardwareAcceleration: 'auto', cursorCapture: true, audioEnabled: false, systemAudioEnabled: false, separateMicrophoneTrack: false, audioSampleRate: 48000, audioChannels: 2, captureSource: 'desktop', voiceWakePhrase: 'Courage', voiceCommandPhrase: 'have it', voiceWakeOnly: false, voiceLocale: 'en-US', theme: 'dark' }
+      const status = { revision: 1, state: 'recording', sessionId: 'fixture-session', pid: 123, error: null, voice, platform: 'UI fixture', backend: 'fixture only', audioDevice: null, outputDir: settings.outputDir, replaySeconds: 30, fps: 30, resolution: 'Native display', videoEncoder: 'libx264', cursorCapture: true }
+      const clip = { id: 7, path: 'C:\\Clips\\fixture.mp4', title: 'fixture', durationMs: 30000, createdAt: 1760000000, thumbnailPath: null, favorite: false }
       window.__TAURI_INTERNALS__ = {
         transformCallback: () => ++id,
         unregisterCallback: () => {},
+        convertFileSrc: path => `asset://localhost/${encodeURIComponent(path)}`,
         invoke: async (cmd, args) => {
           window.calls.push({ cmd, args })
           if (cmd === 'get_settings' || cmd === 'save_settings') return settings
-          if (cmd === 'list_clips') return []
+          if (cmd === 'list_clips') return [clip]
+          if (cmd === 'set_clip_favorite') { clip.favorite = args.favorite; return null }
           if (cmd === 'engine_status' || cmd === 'start_capture') return status
           if (cmd === 'test_voice_phrase') return { normalized: '', wakeMatched: false, commandMatched: false, wouldTrigger: false, reason: 'fixture response' }
           if (cmd === 'start_voice_test' || cmd === 'stop_voice_test') return voice
@@ -61,8 +64,18 @@ const server = spawn('python3', ['-m', 'http.server', '1421', '--bind', '127.0.0
       await page.getByRole('button', { name: new RegExp('^' + theme, 'i') }).click()
       assert.equal(await page.locator('html').getAttribute('data-theme'), theme)
     }
+    await page.getByRole('button', { name: 'Library', exact: true }).click()
+    await page.getByRole('button', { name: 'Inspect fixture' }).click()
+    await page.locator('video[aria-label="Preview fixture"]').waitFor()
+    await page.getByRole('button', { name: 'Copy path' }).last().click()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'C:\\Clips\\fixture.mp4')
+    await page.getByRole('button', { name: 'Favorite fixture' }).click()
+    call = await page.evaluate(() => window.calls.filter(c => c.cmd === 'set_clip_favorite').at(-1))
+    assert.equal(call.args.favorite, true)
+    await page.getByRole('button', { name: 'Show favorite clips' }).click()
+    assert.equal(await page.locator('.library-count').textContent(), '1 clip')
     assert.deepEqual(errors, [])
-    console.log('PASS: browser draft-IPC/no-save action, autocomplete hints, copy/paste, Tab, themes. Native Windows behavior NOT tested.')
+    console.log('PASS: browser draft-IPC/no-save action, preview, copy path, favorite filter, autocomplete hints, copy/paste, Tab, themes. Native Windows behavior NOT tested.')
   } finally {
     if (browser) await browser.close()
     server.kill()

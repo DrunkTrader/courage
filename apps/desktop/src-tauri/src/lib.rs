@@ -19,6 +19,7 @@ use voice::{
     Diagnostics as VoiceDiagnostics, Matcher, RecognitionResult, SpeechEvent, VoiceConfig,
 };
 
+use courage_core::trim;
 use courage_store::{ClipRecord, ClipStore};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem};
@@ -42,7 +43,6 @@ pub struct EngineStatus {
     pub platform: String,
     pub backend: String,
     pub audio_device: Option<String>,
-    pub voice_trigger: String,
     pub voice: VoiceDiagnostics,
     pub output_dir: String,
     pub replay_seconds: u64,
@@ -60,6 +60,8 @@ pub struct ClipResponse {
     pub duration_ms: i64,
     pub created_at: i64,
     pub title: String,
+    pub thumbnail_path: Option<String>,
+    pub favorite: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -91,6 +93,8 @@ pub struct SettingsResponse {
     pub hardware_acceleration: String,
     pub cursor_capture: bool,
     pub audio_enabled: bool,
+    pub system_audio_enabled: bool,
+    pub separate_microphone_track: bool,
     pub audio_sample_rate: u32,
     pub audio_channels: u8,
     pub capture_source: String,
@@ -118,6 +122,8 @@ pub struct SettingsInput {
     pub hardware_acceleration: String,
     pub cursor_capture: bool,
     pub audio_enabled: bool,
+    pub system_audio_enabled: bool,
+    pub separate_microphone_track: bool,
     pub audio_sample_rate: u32,
     pub audio_channels: u8,
     pub capture_source: String,
@@ -145,6 +151,8 @@ struct SettingsFile {
     hardware_acceleration: String,
     cursor_capture: bool,
     audio_enabled: bool,
+    system_audio_enabled: bool,
+    separate_microphone_track: bool,
     audio_sample_rate: u32,
     audio_channels: u8,
     capture_source: String,
@@ -172,6 +180,8 @@ impl Default for SettingsFile {
             hardware_acceleration: "auto".to_owned(),
             cursor_capture: true,
             audio_enabled: true,
+            system_audio_enabled: false,
+            separate_microphone_track: false,
             audio_sample_rate: 48_000,
             audio_channels: 2,
             capture_source: "desktop".to_owned(),
@@ -437,6 +447,8 @@ async fn save_settings(
             hardware_acceleration: settings.hardware_acceleration,
             cursor_capture: settings.cursor_capture,
             audio_enabled: settings.audio_enabled,
+            system_audio_enabled: settings.system_audio_enabled,
+            separate_microphone_track: settings.separate_microphone_track,
             audio_sample_rate: settings.audio_sample_rate,
             audio_channels: settings.audio_channels,
             capture_source: settings.capture_source,
@@ -612,13 +624,17 @@ async fn with_state<T: Send + 'static>(
 
 #[tauri::command]
 async fn list_clips(app: AppHandle) -> Result<Vec<ClipResponse>, String> {
-    with_state(app, |_, state| {
+    with_state(app, |app, state| {
         reconcile_library(state)?;
-        state
+        let clips = state
             .store
             .list_clips()
             .map_err(|error| error.to_string())
-            .map(|clips| clips.into_iter().map(to_response).collect())
+            .map(|clips| clips.into_iter().map(to_response).collect::<Vec<_>>())?;
+        for clip in &clips {
+            allow_clip_assets(app, clip);
+        }
+        Ok(clips)
     })
     .await
 }
@@ -638,10 +654,97 @@ async fn delete_clip(app: AppHandle, id: i64) -> Result<(), String> {
                 format!("Could not delete clip {}: {error}", record.path.display())
             })?;
         }
+        if let Some(thumbnail) = &record.thumbnail_path {
+            if thumbnail == &thumbnail_path_for(&record.path) {
+                let _ = fs::remove_file(thumbnail);
+            }
+        }
         state.store.delete_clip(id).map_err(|error| error.to_string())?;
         diagnostic_event("library.clip_deleted", &format!("id={id}"));
         let _ = app.emit("library-changed", ());
         Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_clip_favorite(app: AppHandle, id: i64, favorite: bool) -> Result<(), String> {
+    with_state(app, move |_, state| {
+        if !state.store.set_favorite(id, favorite).map_err(|error| error.to_string())? {
+            return Err("Clip was not found in the local library".into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn trim_clip(
+    app: AppHandle,
+    id: i64,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<ClipResponse, String> {
+    let operation = Operation::acquire(app.state::<Arc<Control>>().inner())?;
+    with_state(app, move |app, state| {
+        let _operation = operation;
+        if !start_seconds.is_finite()
+            || !end_seconds.is_finite()
+            || start_seconds < 0.0
+            || end_seconds <= start_seconds
+        {
+            return Err("Trim range must be finite, non-negative, and increasing".into());
+        }
+        if end_seconds > 86_400.0 {
+            return Err("Trim range cannot exceed 24 hours".into());
+        }
+        let record = state
+            .store
+            .list_clips()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|clip| clip.id == id)
+            .ok_or("Clip was not found in the local library")?;
+        if !record.path.is_file() {
+            return Err("The selected clip is no longer available".into());
+        }
+        if record.duration_ms > 0 && end_seconds > record.duration_ms as f64 / 1000.0 + 0.1 {
+            return Err("Trim end is longer than the selected clip".into());
+        }
+        let stem =
+            record.path.file_stem().and_then(|value| value.to_str()).unwrap_or("courage-clip");
+        let output = record
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{stem}-trimmed-{}.mp4", unix_timestamp_millis()));
+        let report = trim(
+            &record.path,
+            &output,
+            Duration::from_secs_f64(start_seconds),
+            Duration::from_secs_f64(end_seconds),
+        )
+        .map_err(|error| error.to_string())?;
+        let thumbnail = generate_thumbnail(&report.path);
+        let new_id = state
+            .store
+            .insert_clip(
+                &report.path,
+                (report.duration_seconds * 1000.0) as i64,
+                thumbnail.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        let clip = to_response(ClipRecord {
+            id: new_id,
+            path: report.path,
+            duration_ms: (report.duration_seconds * 1000.0) as i64,
+            created_at: unix_timestamp_seconds(),
+            thumbnail_path: thumbnail,
+            favorite: false,
+        });
+        allow_clip_assets(app, &clip);
+        let _ = app.emit("library-changed", ());
+        Ok(clip)
     })
     .await
 }
@@ -689,6 +792,8 @@ fn settings_response(state: &AppState) -> Result<SettingsResponse, String> {
         hardware_acceleration: state.settings.hardware_acceleration.clone(),
         cursor_capture: state.settings.cursor_capture,
         audio_enabled: state.settings.audio_enabled,
+        system_audio_enabled: state.settings.system_audio_enabled,
+        separate_microphone_track: state.settings.separate_microphone_track,
         audio_sample_rate: state.settings.audio_sample_rate,
         audio_channels: state.settings.audio_channels,
         capture_source: state.settings.capture_source.clone(),
@@ -707,7 +812,18 @@ fn reconcile_library(state: &mut AppState) -> Result<bool, String> {
             return Err("Library reconciliation cancelled by exit".into());
         }
         if !record.path.is_file() {
+            if record.thumbnail_path.as_ref() == Some(&thumbnail_path_for(&record.path)) {
+                let _ = fs::remove_file(thumbnail_path_for(&record.path));
+            }
             changed |= state.store.delete_clip(record.id).map_err(|error| error.to_string())?;
+        } else if record.thumbnail_path.as_ref().is_none_or(|path| !path.is_file()) {
+            if let Some(thumbnail) = generate_thumbnail(&record.path) {
+                state
+                    .store
+                    .insert_clip(&record.path, record.duration_ms, Some(&thumbnail))
+                    .map_err(|error| error.to_string())?;
+                changed = true;
+            }
         }
     }
     let output_dir = state.output_dir();
@@ -729,7 +845,11 @@ fn reconcile_library(state: &mut AppState) -> Result<bool, String> {
             && !state.store.contains_path(&path).map_err(|error| error.to_string())?
         {
             let duration_ms = probe_duration_ms(&path).unwrap_or(0);
-            state.store.insert_clip(&path, duration_ms, None).map_err(|error| error.to_string())?;
+            let thumbnail = generate_thumbnail(&path);
+            state
+                .store
+                .insert_clip(&path, duration_ms, thumbnail.as_deref())
+                .map_err(|error| error.to_string())?;
             changed = true;
         }
     }
@@ -866,7 +986,7 @@ fn status_for(state: &AppState) -> EngineStatus {
                 format!(
                     "{}{}",
                     capture.backend,
-                    if capture.audio_enabled { " + microphone" } else { " (video only)" }
+                    if capture.audio_enabled { " + audio" } else { " (video only)" }
                 ),
                 capture.fps,
                 capture.resolution.clone(),
@@ -900,7 +1020,6 @@ fn status_for(state: &AppState) -> EngineStatus {
         platform: std::env::consts::OS.to_owned(),
         backend,
         audio_device: state.settings.selected_audio_device.clone(),
-        voice_trigger: voice_trigger_status(state),
         voice: state.voice_diagnostics.clone(),
         output_dir: state.output_dir().to_string_lossy().into_owned(),
         replay_seconds: state.settings.replay_seconds,
@@ -908,24 +1027,6 @@ fn status_for(state: &AppState) -> EngineStatus {
         resolution,
         video_encoder,
         cursor_capture: state.settings.cursor_capture,
-    }
-}
-
-fn voice_trigger_status(state: &AppState) -> String {
-    if !state.settings.voice_enabled {
-        return "Voice trigger disabled".to_owned();
-    }
-    if state.voice_diagnostics.listening {
-        return if cfg!(windows) {
-            "Windows Speech · listening in tray".to_owned()
-        } else {
-            "Voice trigger active while app is open".to_owned()
-        };
-    }
-    if cfg!(windows) {
-        "Windows Speech · waiting for capture".to_owned()
-    } else {
-        "Native phrase trigger is not available on this platform".to_owned()
     }
 }
 
@@ -974,15 +1075,26 @@ fn build_capture_command(
     let fps = state.settings.fps;
     command.args(video_input_args(state)?.as_slice());
     let audio_args = audio_input_args(state);
-    let audio_enabled = audio_args.is_some();
-    if let Some(args) = audio_args {
+    let audio_enabled = !audio_args.is_empty();
+    for args in &audio_args {
         command.args(args.as_slice());
     }
     command.args(["-map", "0:v:0"]);
     if audio_enabled {
+        if audio_args.len() == 1 {
+            command.args(["-map", "1:a:0"]);
+        } else {
+            command.args([
+                "-filter_complex",
+                "[1:a:0][2:a:0]amix=inputs=2:duration=longest:dropout_transition=0[mixed]",
+                "-map",
+                "[mixed]",
+            ]);
+            if state.settings.separate_microphone_track {
+                command.args(["-map", "2:a:0"]);
+            }
+        }
         command.args([
-            "-map",
-            "1:a:0",
             "-c:a",
             "aac",
             "-ar",
@@ -1095,17 +1207,39 @@ fn capture_dimensions(settings: &SettingsFile) -> Option<(u32, u32)> {
     }
 }
 
-fn audio_input_args(state: &AppState) -> Option<Vec<String>> {
-    if !state.settings.audio_enabled {
-        return None;
+fn audio_input_args(state: &AppState) -> Vec<Vec<String>> {
+    let mut inputs = Vec::new();
+    if state.settings.system_audio_enabled {
+        if let Some(args) = system_audio_input_args() {
+            inputs.push(args);
+        }
     }
-    let device = state.settings.selected_audio_device.as_deref()?;
-    Some(match std::env::consts::OS {
-        "windows" => vec!["-f".into(), "dshow".into(), "-i".into(), format!("audio={device}")],
-        "macos" => vec!["-f".into(), "avfoundation".into(), "-i".into(), format!("none:{device}")],
-        "linux" => vec!["-f".into(), "pulse".into(), "-i".into(), device.to_owned()],
-        _ => return None,
-    })
+    if state.settings.audio_enabled {
+        if let Some(device) = state.settings.selected_audio_device.as_deref() {
+            let args = match std::env::consts::OS {
+                "windows" => {
+                    vec!["-f".into(), "dshow".into(), "-i".into(), format!("audio={device}")]
+                }
+                "macos" => {
+                    vec!["-f".into(), "avfoundation".into(), "-i".into(), format!("none:{device}")]
+                }
+                "linux" => vec!["-f".into(), "pulse".into(), "-i".into(), device.to_owned()],
+                _ => return inputs,
+            };
+            inputs.push(args);
+        }
+    }
+    inputs
+}
+
+fn system_audio_input_args() -> Option<Vec<String>> {
+    match std::env::consts::OS {
+        "windows" => Some(vec!["-f".into(), "wasapi".into(), "-i".into(), "default".into()]),
+        "linux" => {
+            Some(vec!["-f".into(), "pulse".into(), "-i".into(), "@DEFAULT_SINK@.monitor".into()])
+        }
+        _ => None,
+    }
 }
 
 fn video_quality_args(quality: &str) -> Result<(&'static str, &'static str), String> {
@@ -1372,8 +1506,11 @@ fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
     }
     let duration_ms =
         probe_duration_ms(&output).unwrap_or((state.settings.replay_seconds * 1000) as i64);
-    let id =
-        state.store.insert_clip(&output, duration_ms, None).map_err(|error| error.to_string())?;
+    let thumbnail = generate_thumbnail(&output);
+    let id = state
+        .store
+        .insert_clip(&output, duration_ms, thumbnail.as_deref())
+        .map_err(|error| error.to_string())?;
     diagnostic_event("library.clip_saved", &format!("id={id} bytes={size}"));
     Ok(ClipResponse {
         id,
@@ -1385,6 +1522,8 @@ fn save_replay_inner(state: &mut AppState) -> Result<ClipResponse, String> {
             .and_then(|name| name.to_str())
             .unwrap_or("Courage clip")
             .to_owned(),
+        thumbnail_path: thumbnail.map(|path| path.to_string_lossy().into_owned()),
+        favorite: false,
     })
 }
 
@@ -1449,6 +1588,39 @@ fn probe_duration_ms(path: &Path) -> Option<i64> {
     Some((seconds * 1000.0) as i64)
 }
 
+fn generate_thumbnail(path: &Path) -> Option<PathBuf> {
+    let thumbnail = thumbnail_path_for(path);
+    if thumbnail.is_file() {
+        return Some(thumbnail);
+    }
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", "0.5", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4"])
+        .arg(&thumbnail);
+    hide_console_window(&mut command);
+    match ManagedChild::output(&mut command, Duration::from_secs(10), None) {
+        Ok(output) if output.status.success() && thumbnail.is_file() => Some(thumbnail),
+        _ => {
+            let _ = fs::remove_file(&thumbnail);
+            None
+        }
+    }
+}
+
+fn thumbnail_path_for(path: &Path) -> PathBuf {
+    path.with_extension("thumbnail.jpg")
+}
+
+fn allow_clip_assets(app: &AppHandle, clip: &ClipResponse) {
+    let scope = app.asset_protocol_scope();
+    let _ = scope.allow_file(&clip.path);
+    if let Some(thumbnail) = &clip.thumbnail_path {
+        let _ = scope.allow_file(thumbnail);
+    }
+}
+
 fn to_response(record: ClipRecord) -> ClipResponse {
     let title =
         record.path.file_stem().and_then(|name| name.to_str()).unwrap_or("Courage clip").to_owned();
@@ -1458,10 +1630,13 @@ fn to_response(record: ClipRecord) -> ClipResponse {
         duration_ms: record.duration_ms,
         created_at: record.created_at,
         title,
+        thumbnail_path: record.thumbnail_path.map(|path| path.to_string_lossy().into_owned()),
+        favorite: record.favorite,
     }
 }
 
 fn notify_clip_saved(app: &AppHandle, clip: &ClipResponse, trigger: &str) {
+    allow_clip_assets(app, clip);
     #[cfg(windows)]
     {
         use tauri_winrt_notification::{Duration as ToastDuration, Toast};
@@ -1760,11 +1935,6 @@ fn hide_to_tray(app: AppHandle) {
     }
 }
 
-#[tauri::command]
-fn quit_app(app: AppHandle) {
-    request_exit(&app);
-}
-
 fn request_exit(app: &AppHandle) {
     let control = app.state::<Arc<Control>>().inner().clone();
     if control.exiting.swap(true, Ordering::AcqRel) {
@@ -1882,11 +2052,12 @@ pub fn run() {
             start_capture,
             stop_capture,
             save_replay,
+            trim_clip,
             list_clips,
             delete_clip,
+            set_clip_favorite,
             open_path,
-            hide_to_tray,
-            quit_app
+            hide_to_tray
         ])
         .build(tauri::generate_context!())
         .expect("error while running Courage");
@@ -1929,7 +2100,34 @@ mod tests {
         assert!(!settings.voice_enabled);
         assert_eq!(settings.fps, 30);
         assert_eq!(settings.resolution_preset, "native");
+        assert!(!settings.system_audio_enabled);
+        assert!(!settings.separate_microphone_track);
         assert_eq!(settings.theme, "dark");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_system_audio_uses_the_default_pulse_monitor() {
+        use super::*;
+
+        let root = std::env::temp_dir().join(format!(
+            "courage-audio-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis()
+        ));
+        let mut state = AppState::new(root.clone()).expect("state");
+        state.settings.audio_enabled = false;
+        state.settings.system_audio_enabled = true;
+        assert_eq!(
+            audio_input_args(&state),
+            vec![vec![
+                "-f".to_owned(),
+                "pulse".to_owned(),
+                "-i".to_owned(),
+                "@DEFAULT_SINK@.monitor".to_owned(),
+            ]]
+        );
+        std::fs::remove_dir_all(root).expect("remove test state");
     }
 
     #[test]

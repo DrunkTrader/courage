@@ -19,6 +19,7 @@ pub struct ClipRecord {
     pub duration_ms: i64,
     pub created_at: i64,
     pub thumbnail_path: Option<PathBuf>,
+    pub favorite: bool,
 }
 
 pub struct ClipStore {
@@ -48,10 +49,20 @@ impl ClipStore {
                  path TEXT NOT NULL UNIQUE,
                  duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
                  created_at INTEGER NOT NULL,
-                 thumbnail_path TEXT
-             );
+                 thumbnail_path TEXT,
+                 favorite INTEGER NOT NULL DEFAULT 0
+              );
              CREATE INDEX IF NOT EXISTS idx_clips_created_at ON clips(created_at DESC);",
         )?;
+        let has_favorite = self.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('clips') WHERE name = 'favorite'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if !has_favorite {
+            self.connection
+                .execute("ALTER TABLE clips ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         Ok(())
     }
 
@@ -86,7 +97,7 @@ impl ClipStore {
 
     pub fn list_clips(&self) -> Result<Vec<ClipRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, path, duration_ms, created_at, thumbnail_path
+            "SELECT id, path, duration_ms, created_at, thumbnail_path, favorite
              FROM clips ORDER BY created_at DESC, id DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -96,6 +107,7 @@ impl ClipStore {
                 duration_ms: row.get(2)?,
                 created_at: row.get(3)?,
                 thumbnail_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                favorite: row.get::<_, i64>(5)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -108,6 +120,13 @@ impl ClipStore {
             |row| row.get(0),
         )?;
         Ok(exists)
+    }
+
+    pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .execute("UPDATE clips SET favorite = ?1 WHERE id = ?2", (favorite as i64, id))?
+            > 0)
     }
 
     pub fn delete_clip(&self, id: i64) -> Result<bool, StoreError> {
@@ -129,8 +148,42 @@ mod tests {
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].duration_ms, 1_250);
         assert_eq!(clips[0].thumbnail_path.as_deref(), Some(Path::new("target/example.jpg")));
+        assert!(!clips[0].favorite);
         assert!(store.contains_path("target/example.mp4").expect("contains"));
+        store.set_favorite(clips[0].id, true).expect("favorite");
+        assert!(store.list_clips().unwrap()[0].favorite);
         assert!(store.delete_clip(clips[0].id).expect("delete"));
         assert!(!store.contains_path("target/example.mp4").expect("not contains"));
+    }
+
+    #[test]
+    fn migrates_existing_clip_table_without_favorite_column() {
+        let path = std::env::temp_dir().join(format!(
+            "courage-store-migration-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let connection = Connection::open(&path).expect("create legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE clips (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    duration_ms INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    thumbnail_path TEXT
+                );",
+            )
+            .expect("legacy schema");
+        drop(connection);
+
+        let store = ClipStore::open(&path).expect("migrate");
+        store.insert_clip("legacy.mp4", 1000, None).expect("insert migrated row");
+        let clip = store.list_clips().unwrap().pop().unwrap();
+        assert!(!clip.favorite);
+        store.set_favorite(clip.id, true).expect("set migrated favorite");
+        assert!(store.list_clips().unwrap()[0].favorite);
+        drop(store);
+        std::fs::remove_file(path).expect("remove test database");
     }
 }

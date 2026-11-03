@@ -2,8 +2,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::thread::{self, JoinHandle};
 
 use crate::{CoreError, FrameSnapshot, VideoSpec};
 
@@ -25,82 +23,6 @@ pub struct ExportReport {
     pub frame_count: usize,
     pub duration_seconds: f64,
     pub bytes: u64,
-}
-
-struct ExportJob {
-    snapshot: FrameSnapshot,
-    output: PathBuf,
-    options: ExportOptions,
-    result: SyncSender<Result<ExportReport, CoreError>>,
-}
-
-pub struct ExportTicket {
-    result: Receiver<Result<ExportReport, CoreError>>,
-}
-
-impl ExportTicket {
-    /// Wait for a single export result. Call this outside the capture path.
-    pub fn wait(self) -> Result<ExportReport, CoreError> {
-        self.result.recv().map_err(|_| CoreError::ExportQueueClosed)?
-    }
-}
-
-pub struct ExportQueue {
-    sender: Option<SyncSender<ExportJob>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl ExportQueue {
-    pub fn new(exporter: ClipExporter, capacity: usize) -> Result<Self, CoreError> {
-        if capacity == 0 {
-            return Err(CoreError::InvalidExportQueueCapacity);
-        }
-        let (sender, receiver) = sync_channel::<ExportJob>(capacity);
-        let worker = thread::Builder::new()
-            .name("courage-export".to_owned())
-            .spawn(move || export_worker(exporter, receiver))
-            .map_err(CoreError::ExportWorkerSpawn)?;
-        Ok(Self { sender: Some(sender), worker: Some(worker) })
-    }
-
-    /// Queue an export without waiting for disk or FFmpeg. A full queue is a
-    /// recoverable backpressure signal for the caller.
-    pub fn try_submit(
-        &self,
-        snapshot: FrameSnapshot,
-        output: impl AsRef<Path>,
-        options: ExportOptions,
-    ) -> Result<ExportTicket, CoreError> {
-        let (result_sender, result) = sync_channel(1);
-        let job = ExportJob {
-            snapshot,
-            output: output.as_ref().to_path_buf(),
-            options,
-            result: result_sender,
-        };
-        let sender = self.sender.as_ref().ok_or(CoreError::ExportQueueClosed)?;
-        match sender.try_send(job) {
-            Ok(()) => Ok(ExportTicket { result }),
-            Err(TrySendError::Full(_)) => Err(CoreError::ExportQueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(CoreError::ExportQueueClosed),
-        }
-    }
-}
-
-impl Drop for ExportQueue {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn export_worker(exporter: ClipExporter, receiver: Receiver<ExportJob>) {
-    for job in receiver {
-        let result = exporter.export(&job.snapshot, job.output, job.options);
-        let _ = job.result.send(result);
-    }
 }
 
 pub struct ClipExporter {

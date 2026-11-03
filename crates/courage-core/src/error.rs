@@ -16,16 +16,6 @@ pub enum CoreError {
     InvalidBufferCapacity,
     #[error("buffer byte budget must be greater than zero")]
     InvalidByteBudget,
-    #[error("capture state lock is poisoned")]
-    StatePoisoned,
-    #[error("export queue capacity must be greater than zero")]
-    InvalidExportQueueCapacity,
-    #[error("export queue is full")]
-    ExportQueueFull,
-    #[error("export queue worker is closed")]
-    ExportQueueClosed,
-    #[error("failed to start export worker: {0}")]
-    ExportWorkerSpawn(#[source] std::io::Error),
     #[error("frame is larger than the buffer byte budget")]
     FrameExceedsByteBudget,
     #[error("no frames are available to export")]

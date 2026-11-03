@@ -12,63 +12,143 @@ pub struct EditReport {
     pub bytes: u64,
 }
 
-pub struct ClipEditor;
-
-impl ClipEditor {
-    pub fn trim(
-        input: impl AsRef<Path>,
-        output: impl AsRef<Path>,
-        start: Duration,
-        end: Duration,
-    ) -> Result<EditReport, CoreError> {
-        if end <= start {
-            return Err(CoreError::InvalidTrimRange);
-        }
-        let input = input.as_ref();
-        let output = output.as_ref();
-        if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).map_err(|source| CoreError::CreateExportDirectory {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let duration = end.saturating_sub(start).as_secs_f64();
-        let mut command = Command::new("ffmpeg");
-        command
-            .args(["-y", "-hide_banner", "-loglevel", "error"])
-            .args(["-ss", &format_duration(start), "-i"])
-            .arg(input)
-            .args(["-t", &format!("{duration:.3}"), "-map", "0"])
-            .args([
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg(output)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let output_status = command.output().map_err(CoreError::FfmpegUnavailable)?;
-        if !output_status.status.success() {
-            return Err(CoreError::FfmpegFailed {
-                status: output_status.status.to_string(),
-                stderr: String::from_utf8_lossy(&output_status.stderr).trim().to_owned(),
-            });
-        }
-        let bytes = fs::metadata(output).map_err(CoreError::ExportMetadata)?.len();
-        Ok(EditReport { path: output.to_path_buf(), duration_seconds: duration, bytes })
+pub fn trim(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    start: Duration,
+    end: Duration,
+) -> Result<EditReport, CoreError> {
+    if end <= start {
+        return Err(CoreError::InvalidTrimRange);
     }
+    let input = input.as_ref();
+    let output = output.as_ref();
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| CoreError::CreateExportDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let duration = end.saturating_sub(start).as_secs_f64();
+    if let Ok(report) = stream_copy(input, output, start, duration) {
+        return Ok(report);
+    }
+
+    reencode(input, output, start, duration)
+}
+
+fn stream_copy(
+    input: &Path,
+    output: &Path,
+    start: Duration,
+    duration: f64,
+) -> Result<EditReport, CoreError> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-ss", &format_duration(start), "-i"])
+        .arg(input)
+        .args(["-t", &format!("{duration:.3}"), "-map", "0"])
+        .args(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output_status = command.output().map_err(CoreError::FfmpegUnavailable)?;
+    if !output_status.status.success() {
+        let _ = fs::remove_file(output);
+        return Err(CoreError::FfmpegFailed {
+            status: output_status.status.to_string(),
+            stderr: String::from_utf8_lossy(&output_status.stderr).trim().to_owned(),
+        });
+    }
+    let bytes = fs::metadata(output).map_err(CoreError::ExportMetadata)?.len();
+    if bytes == 0 {
+        let _ = fs::remove_file(output);
+        return Err(CoreError::ExportMetadata(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream-copy output is empty",
+        )));
+    }
+    let actual_duration = probe_duration(output)?;
+    if (actual_duration - duration).abs() > 0.1 {
+        let _ = fs::remove_file(output);
+        return Err(CoreError::ExportMetadata(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream-copy trim did not preserve the requested range",
+        )));
+    }
+    Ok(EditReport { path: output.to_path_buf(), duration_seconds: duration, bytes })
+}
+
+fn probe_duration(path: &Path) -> Result<f64, CoreError> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(CoreError::FfmpegUnavailable)?;
+    if !output.status.success() {
+        return Err(CoreError::FfmpegFailed {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse::<f64>().map_err(|_| {
+        CoreError::ExportMetadata(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ffprobe returned an invalid duration",
+        ))
+    })
+}
+
+fn reencode(
+    input: &Path,
+    output: &Path,
+    start: Duration,
+    duration: f64,
+) -> Result<EditReport, CoreError> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-ss", &format_duration(start), "-i"])
+        .arg(input)
+        .args(["-t", &format!("{duration:.3}"), "-map", "0"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output_status = command.output().map_err(CoreError::FfmpegUnavailable)?;
+    if !output_status.status.success() {
+        return Err(CoreError::FfmpegFailed {
+            status: output_status.status.to_string(),
+            stderr: String::from_utf8_lossy(&output_status.stderr).trim().to_owned(),
+        });
+    }
+    let bytes = fs::metadata(output).map_err(CoreError::ExportMetadata)?.len();
+    Ok(EditReport { path: output.to_path_buf(), duration_seconds: duration, bytes })
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -81,12 +161,8 @@ mod tests {
 
     #[test]
     fn rejects_backwards_trim_range() {
-        let result = ClipEditor::trim(
-            "input.mp4",
-            "output.mp4",
-            Duration::from_secs(2),
-            Duration::from_secs(1),
-        );
+        let result =
+            trim("input.mp4", "output.mp4", Duration::from_secs(2), Duration::from_secs(1));
         assert!(matches!(result, Err(CoreError::InvalidTrimRange)));
     }
 }

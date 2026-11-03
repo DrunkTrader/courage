@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{CaptureSource, CoreError, VideoFrame, VideoSpec};
+use crate::{CoreError, VideoFrame, VideoSpec};
 
 pub struct SyntheticSource {
     spec: VideoSpec,
@@ -31,24 +31,9 @@ impl SyntheticSource {
         let timestamp = Duration::from_secs_f64(sequence as f64 / self.spec.fps as f64);
         VideoFrame::new(sequence, timestamp, rgb24, self.spec)
     }
-}
-
-impl Iterator for SyntheticSource {
-    type Item = Result<VideoFrame, CoreError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = self.make_frame(self.next_sequence);
+    pub fn next_frame(&mut self) -> Result<VideoFrame, CoreError> {
+        let frame = self.make_frame(self.next_sequence);
         self.next_sequence = self.next_sequence.saturating_add(1);
-        Some(result)
-    }
-}
-
-impl CaptureSource for SyntheticSource {
-    fn spec(&self) -> VideoSpec {
-        self.spec
-    }
-
-    fn next_frame(&mut self) -> Result<Option<VideoFrame>, CoreError> {
-        self.next().transpose()
+        frame
     }
 }

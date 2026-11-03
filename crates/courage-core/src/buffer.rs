@@ -1,7 +1,52 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::{CoreError, VideoFrame};
+use crate::CoreError;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoSpec {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl VideoSpec {
+    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, CoreError> {
+        if width == 0 || height == 0 {
+            return Err(CoreError::InvalidDimensions);
+        }
+        if fps == 0 {
+            return Err(CoreError::InvalidFrameRate);
+        }
+        Ok(Self { width, height, fps })
+    }
+
+    pub fn frame_bytes(self) -> usize {
+        self.width as usize * self.height as usize * 3
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoFrame {
+    pub sequence: u64,
+    pub timestamp: Duration,
+    pub rgb24: Vec<u8>,
+}
+
+impl VideoFrame {
+    pub fn new(
+        sequence: u64,
+        timestamp: Duration,
+        rgb24: Vec<u8>,
+        spec: VideoSpec,
+    ) -> Result<Self, CoreError> {
+        let expected = spec.frame_bytes();
+        if rgb24.len() != expected {
+            return Err(CoreError::InvalidFrameSize { actual: rgb24.len(), expected });
+        }
+        Ok(Self { sequence, timestamp, rgb24 })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferStats {
