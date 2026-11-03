@@ -27,23 +27,32 @@ public static class CourageStop {
         throw "No System.Speech recognizer for $($config.locale). Installed: $(($installed | ForEach-Object { $_.Culture.Name }) -join ', ')"
     }
     $recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine($info)
-    $choices = New-Object System.Speech.Recognition.Choices
     $wake = $config.wakePhrase.Trim()
-    if ($config.wakeOnly) { $choices.Add($wake) }
-    else {
-        $choices.Add("$wake $($config.commandPhrase.Trim())")
-        # Recognize incomplete utterances for diagnostics; Rust never accepts them.
-        $choices.Add($wake)
-        $choices.Add($config.commandPhrase.Trim())
+    $fullBuilder = New-Object System.Speech.Recognition.GrammarBuilder
+    $fullBuilder.Culture = $info.Culture
+    $fullBuilder.Append($wake)
+    if (-not $config.wakeOnly) {
+        # Build the command as an ordered grammar instead of one free-form
+        # string. This tolerates a natural pause after the wake phrase.
+        $fullBuilder.Append($config.commandPhrase.Trim())
     }
-    $builder = New-Object System.Speech.Recognition.GrammarBuilder
-    $builder.Culture = $info.Culture
-    $builder.Append($choices)
-    $recognizer.LoadGrammar((New-Object System.Speech.Recognition.Grammar($builder)))
-    $recognizer.InitialSilenceTimeout = [TimeSpan]::FromMilliseconds(300)
-    $recognizer.BabbleTimeout = [TimeSpan]::FromSeconds(2)
-    $recognizer.EndSilenceTimeout = [TimeSpan]::FromMilliseconds(250)
-    $recognizer.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromMilliseconds(400)
+    $recognizer.LoadGrammar((New-Object System.Speech.Recognition.Grammar($fullBuilder)))
+    if (-not $config.wakeOnly) {
+        # Emit isolated wake/command results too; Rust uses them for the
+        # short two-step flow while still requiring the exact configured words.
+        $diagnosticChoices = New-Object System.Speech.Recognition.Choices
+        $diagnosticChoices.Add($wake)
+        $diagnosticChoices.Add($config.commandPhrase.Trim())
+        $diagnosticBuilder = New-Object System.Speech.Recognition.GrammarBuilder
+        $diagnosticBuilder.Culture = $info.Culture
+        $diagnosticBuilder.Append($diagnosticChoices)
+        $recognizer.LoadGrammar((New-Object System.Speech.Recognition.Grammar($diagnosticBuilder)))
+    }
+    $recognizer.MaxAlternates = 3
+    $recognizer.InitialSilenceTimeout = [TimeSpan]::FromMilliseconds(500)
+    $recognizer.BabbleTimeout = [TimeSpan]::FromSeconds(4)
+    $recognizer.EndSilenceTimeout = [TimeSpan]::FromMilliseconds(500)
+    $recognizer.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromMilliseconds(800)
     $recognizer.SetInputToDefaultAudioDevice()
     $format = $recognizer.AudioFormat
     Send-Event @{ kind='ready'; locale=$info.Culture.Name; microphone='Windows default recording device (System.Speech)'; audioFormat="$($format.SamplesPerSecond) Hz / $($format.ChannelCount) channels / $($format.BitsPerSample) bits" }
@@ -51,7 +60,7 @@ public static class CourageStop {
     $id = 0
     while (-not [CourageStop]::Requested) {
         # Synchronous recognition returns final results only; hypotheses never trigger.
-        $result = $recognizer.Recognize([TimeSpan]::FromMilliseconds(300))
+        $result = $recognizer.Recognize([TimeSpan]::FromMilliseconds(500))
         if ($result -and -not [CourageStop]::Requested) {
             $id++
             Send-Event @{ kind='result'; id=$id; phrase=$result.Text; confidence=$result.Confidence; finalResult=$true }

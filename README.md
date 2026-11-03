@@ -17,6 +17,8 @@ installer acceptance remain separate from those checks:
 - FFmpeg-backed rolling desktop capture split into bounded one-second segments;
 - non-blocking replay save boundary that never pauses the capture process;
 - local MP4 export with optional system audio, a user-selected microphone, and an opt-in separate microphone track;
+- offline Windows voice triggering with ordered wake/command grammar, a short
+  two-step wake flow, locale diagnostics, and no-save microphone testing;
 - in-app video preview, generated thumbnails, favorite filtering, copy-path handoff, and single-range trimmed copies;
 - SQLite clip metadata store with thumbnail and favorite migration;
 - Tauri 2 desktop shell with a persistent system tray, global save hotkey,
@@ -27,7 +29,10 @@ The desktop runtime uses FFmpeg native input backends: Windows `gdigrab` plus
 DirectShow microphone and WASAPI system-audio inputs, macOS `avfoundation`, and
 Linux X11 plus PulseAudio (including the default sink monitor for system audio).
 Wayland PipeWire capture, macOS system audio, and per-GPU hardware encoder
-selection still require host verification. On Windows, the wake phrase runs through a
+selection still require host verification. An explicit hardware encoder
+selection is verified before capture and reports its FFmpeg/driver error instead
+of silently switching to software; automatic mode keeps the software fallback.
+On Windows, the wake phrase runs through a
 native `System.Speech` listener that continues while the window is hidden in
 the tray. System.Speech uses the Windows default input device; the selected
 recording microphone is used by FFmpeg for saved clips.

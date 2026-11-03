@@ -1257,6 +1257,7 @@ fn resolve_video_encoder(
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let requested = if preference == "auto" { hardware } else { preference };
+    let explicit = preference != "auto" || hardware != "auto";
     let candidates = match requested {
         "auto" => ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"].as_slice(),
         "libx264" => ["libx264"].as_slice(),
@@ -1271,20 +1272,27 @@ fn resolve_video_encoder(
     let encoders = ManagedChild::output(&mut probe, Duration::from_secs(5), Some(cancel))
         .map_err(|error| format!("Could not inspect FFmpeg encoders: {error}"))?;
     let text = String::from_utf8_lossy(&encoders.stdout);
-    Ok(candidates
-        .iter()
-        .filter(|candidate| {
-            text.lines().any(|line| line.split_whitespace().any(|field| field == **candidate))
-        })
-        .find(|candidate| encoder_works(candidate, cancel))
-        .unwrap_or(&"libx264")
-        .to_string())
+    for candidate in candidates {
+        if !text.lines().any(|line| line.split_whitespace().any(|field| field == *candidate)) {
+            if explicit {
+                return Err(format!(
+                    "Requested video encoder {candidate} is not present in this FFmpeg build"
+                ));
+            }
+            continue;
+        }
+        match probe_encoder(candidate, cancel) {
+            Ok(()) => return Ok((*candidate).to_owned()),
+            Err(error) if explicit => {
+                return Err(format!("Requested video encoder {candidate} is unavailable: {error}"))
+            }
+            Err(_) => {}
+        }
+    }
+    Ok("libx264".to_owned())
 }
 
-fn encoder_works(encoder: &&str, cancel: &AtomicBool) -> bool {
-    if *encoder == "libx264" {
-        return true;
-    }
+fn probe_encoder(encoder: &str, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
@@ -1293,9 +1301,11 @@ fn encoder_works(encoder: &&str, cancel: &AtomicBool) -> bool {
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=16x16:r=1",
+        "testsrc2=size=64x64:rate=1",
         "-frames:v",
-        "1",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
         "-c:v",
         encoder,
         "-f",
@@ -1303,8 +1313,13 @@ fn encoder_works(encoder: &&str, cancel: &AtomicBool) -> bool {
         "-",
     ]);
     hide_console_window(&mut command);
-    ManagedChild::output(&mut command, Duration::from_secs(3), Some(cancel))
-        .is_ok_and(|output| output.status.success())
+    let output = ManagedChild::output(&mut command, Duration::from_secs(5), Some(cancel))
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn new_session_dir(data_dir: &Path) -> Result<PathBuf, String> {
