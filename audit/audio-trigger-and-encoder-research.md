@@ -86,8 +86,10 @@ hardware preference are automatic.
 2. Explicit `videoEncoder` or `hardwareAcceleration` choices no longer downgrade
    silently. Capture startup returns whether the encoder is absent from FFmpeg or
    failed initialization.
-3. The probe uses two `yuv420p` test frames and a five-second timeout, closer to
-   the actual capture format than the old one-frame color probe.
+3. The probe uses two even `yuv420p` test frames at a minimum of `320×240`
+   (`640×360` for native resolution) and a five-second timeout. This avoids
+   false NVENC failures from the old `64×64` probe while remaining close to the
+   actual capture format.
 
 ## Recommended next measurement
 
