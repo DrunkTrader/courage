@@ -30,6 +30,7 @@ const DEFAULT_REPLAY_SECONDS: u64 = 30;
 const DEFAULT_HOTKEY: &str = "CommandOrControl+Shift+1";
 const DEFAULT_WAKE_PHRASE: &str = "Courage";
 const DEFAULT_COMMAND_PHRASE: &str = "have it";
+const ENCODER_PROBE_DIMENSIONS: (u32, u32) = (640, 360);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1113,6 +1114,7 @@ fn build_capture_command(
     let encoder = resolve_video_encoder(
         &state.settings.video_encoder,
         &state.settings.hardware_acceleration,
+        encoder_probe_dimensions(&state.settings),
         &state.control.stop_requested,
     )?;
     let (preset, crf) = video_quality_args(&state.settings.video_quality)?;
@@ -1207,6 +1209,14 @@ fn capture_dimensions(settings: &SettingsFile) -> Option<(u32, u32)> {
     }
 }
 
+fn encoder_probe_dimensions(settings: &SettingsFile) -> (u32, u32) {
+    let (width, height) = capture_dimensions(settings).unwrap_or(ENCODER_PROBE_DIMENSIONS);
+    // Keep the probe inside the validated capture range and even: hardware
+    // encoders reject undersized or odd test frames before the real capture
+    // command has a chance to start.
+    (width.max(320) & !1, height.max(240) & !1)
+}
+
 fn audio_input_args(state: &AppState) -> Vec<Vec<String>> {
     let mut inputs = Vec::new();
     if state.settings.system_audio_enabled {
@@ -1254,6 +1264,7 @@ fn video_quality_args(quality: &str) -> Result<(&'static str, &'static str), Str
 fn resolve_video_encoder(
     preference: &str,
     hardware: &str,
+    probe_dimensions: (u32, u32),
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     let requested = if preference == "auto" { hardware } else { preference };
@@ -1281,7 +1292,7 @@ fn resolve_video_encoder(
             }
             continue;
         }
-        match probe_encoder(candidate, cancel) {
+        match probe_encoder(candidate, probe_dimensions, cancel) {
             Ok(()) => return Ok((*candidate).to_owned()),
             Err(error) if explicit => {
                 return Err(format!("Requested video encoder {candidate} is unavailable: {error}"))
@@ -1292,7 +1303,11 @@ fn resolve_video_encoder(
     Ok("libx264".to_owned())
 }
 
-fn probe_encoder(encoder: &str, cancel: &AtomicBool) -> Result<(), String> {
+fn probe_encoder(
+    encoder: &str,
+    (width, height): (u32, u32),
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
@@ -1301,7 +1316,7 @@ fn probe_encoder(encoder: &str, cancel: &AtomicBool) -> Result<(), String> {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=64x64:rate=1",
+        &format!("testsrc2=size={width}x{height}:rate=1"),
         "-frames:v",
         "2",
         "-pix_fmt",
@@ -2088,7 +2103,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_phrase, SettingsFile};
+    use super::{encoder_probe_dimensions, normalize_phrase, SettingsFile};
 
     #[test]
     fn normalizes_voice_punctuation_and_case() {
@@ -2118,6 +2133,24 @@ mod tests {
         assert!(!settings.system_audio_enabled);
         assert!(!settings.separate_microphone_track);
         assert_eq!(settings.theme, "dark");
+    }
+
+    #[test]
+    fn encoder_probe_uses_valid_even_dimensions() {
+        let settings = SettingsFile::default();
+        assert_eq!(encoder_probe_dimensions(&settings), (640, 360));
+
+        let mut custom = SettingsFile {
+            resolution_preset: "custom".into(),
+            width: Some(321),
+            height: Some(241),
+            ..SettingsFile::default()
+        };
+        assert_eq!(encoder_probe_dimensions(&custom), (320, 240));
+
+        custom.width = Some(64);
+        custom.height = Some(64);
+        assert_eq!(encoder_probe_dimensions(&custom), (320, 240));
     }
 
     #[cfg(target_os = "linux")]

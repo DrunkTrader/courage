@@ -44,7 +44,7 @@ add accounts, uploads, telemetry, game injection, or a streaming suite.
 | 2026-11-03 | Baseline reviewed; existing working-tree cleanup preserved | PASS |
 | 2026-11-03 | `cargo fmt --all -- --check` | PASS |
 | 2026-11-03 | `cargo check --workspace` with Cargo 1.99.1 | PASS |
-| 2026-11-03 | `cargo test --workspace` | PASS: 23 passed, 5 ignored |
+| 2026-11-03 | `cargo test --workspace` | PASS: 24 passed, 5 ignored |
 | 2026-11-03 | ignored FFmpeg 20-cycle desktop save/restart test | PASS: 10 saved clips and generated thumbnails preserved |
 | 2026-11-03 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
 | 2026-11-03 | `make media-validation` with Cargo 1.99.1 | PASS: H.264/AAC demo and 2-second trim |
@@ -56,6 +56,8 @@ add accounts, uploads, telemetry, game injection, or a streaming suite.
 | 2026-11-03 | `make media-validation` after voice/encoder changes | PASS: H.264/AAC demo and 2-second trim |
 | 2026-11-03 | `npm --prefix apps/desktop run build` after UI copy changes | PASS |
 | 2026-11-03 | Browser smoke after UI copy changes | PASS; native Windows behavior not tested |
+| 2026-11-03 | NVENC probe regression fix | PASS: probe dimensions are even and at least `320×240`; focused test passes |
+| 2026-11-03 | Full workspace verification after NVENC fix | PASS: 24 passed, 5 ignored; clippy and desktop build pass |
 
 ## Deferred honestly
 
