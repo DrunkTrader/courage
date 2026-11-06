@@ -581,7 +581,8 @@ export function App() {
         </div>
       </aside>
 
-      <section className="workspace">
+      <div className="workspace-scroll">
+        <section className="workspace">
         <header className="topbar">
           <div>
             <span className="eyebrow">{view === 'library' ? 'Your moments' : view === 'capture' ? 'Capture desk' : 'Control room'}</span>
@@ -642,7 +643,8 @@ export function App() {
         )}
 
         <footer className="status-line" aria-live="polite"><span className="status-check"><Icon name="check" size={12} /></span>{message}<span className="status-meta">{status.platform} · {status.backend}</span></footer>
-      </section>
+        </section>
+      </div>
       {flash && <div className="flash-notice" role="status" aria-live="assertive"><div className="flash-mark"><Icon name="check" size={13} /></div><div><strong>{flash.title}</strong><span>{flash.body}</span></div></div>}
     </main>
   )
@@ -709,36 +711,43 @@ type SettingsViewProps = {
 function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory, onRefreshDevices, onApply, onReset, saving, needsRestart, message, lastVoiceResult, voice, platform }: SettingsViewProps) {
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft({ ...draft, [key]: value })
   const [voiceTest, setVoiceTest] = useState('Courage, have it')
-  const [voiceResult, setVoiceResult] = useState<string | null>(null)
+  const [phraseResult, setPhraseResult] = useState<VoiceDecision | null>(null)
+  const [phraseError, setPhraseError] = useState<string | null>(null)
+  const [micError, setMicError] = useState<string | null>(null)
   const [testingMic, setTestingMic] = useState(false)
   const voiceConfig = { wakePhrase: draft.voiceWakePhrase, commandPhrase: draft.voiceCommandPhrase, wakeOnly: draft.voiceWakeOnly, locale: draft.voiceLocale }
   const observation = lastVoiceResult?.generation === voice.generation ? lastVoiceResult : null
+  const micListening = voice.listening && voice.testMode
+  const micState = testingMic ? 'Updating…' : micListening ? 'Listening for the draft phrases' : voice.listening ? 'Saved trigger active' : 'Stopped'
 
   useEffect(() => {
-    setVoiceResult(null)
+    setPhraseResult(null)
+    setPhraseError(null)
     return () => { if (isDesktop()) void invoke('stop_voice_test').catch(() => undefined) }
   }, [draft.voiceWakePhrase, draft.voiceCommandPhrase, draft.voiceWakeOnly, draft.voiceLocale])
 
   async function testMicrophone() {
     setTestingMic(true)
+    setMicError(null)
     try {
       if (voice.testMode && voice.listening) await invoke('stop_voice_test')
       else await invoke('start_voice_test', { config: voiceConfig })
     } catch (error) {
-      setVoiceResult(`Microphone test failed: ${errorText(error)}`)
+      setMicError(`Microphone test failed: ${errorText(error)}`)
     } finally { setTestingMic(false) }
   }
 
   async function testVoice() {
+    setPhraseError(null)
+    setPhraseResult(null)
     if (!isDesktop()) {
-      setVoiceResult('Run the desktop build to test native recognition.')
+      setPhraseError('Run the desktop build to test native recognition.')
       return
     }
     try {
-      const result = await invoke<VoiceDecision>('test_voice_phrase', { phrase: voiceTest, config: voiceConfig })
-      setVoiceResult(`Text simulation only · ${result.wouldTrigger ? 'matched' : 'rejected'} · wake ${result.wakeMatched ? 'matched' : 'missed'} · command ${result.commandMatched ? 'matched' : 'missed'} · ${result.reason}`)
+      setPhraseResult(await invoke<VoiceDecision>('test_voice_phrase', { phrase: voiceTest, config: voiceConfig }))
     } catch (error) {
-      setVoiceResult(`Test failed: ${errorText(error)}`)
+      setPhraseError(`Test failed: ${errorText(error)}`)
     }
   }
 
@@ -783,14 +792,49 @@ function SettingsView({ draft, setDraft, theme, onThemeChange, onChooseDirectory
           <SettingField label="Recognition locale" help="Must match an installed Windows System.Speech recognizer, for example en-US or en-GB."><input id="voice-locale" autoComplete="off" spellCheck={false} maxLength={32} value={draft.voiceLocale} onChange={(event) => update('voiceLocale', event.target.value)} /></SettingField>
         </div>
         <ToggleRow label="Wake phrase alone saves" help="Off means both wake and command are required." checked={draft.voiceWakeOnly} disabled={!draft.voiceEnabled} onChange={(checked) => update('voiceWakeOnly', checked)} />
-        <div className="voice-test">
-          <div className="setting-label"><strong>Test the current draft</strong><small>Text simulation does not test microphone accuracy. Microphone test replaces the active voice trigger for up to 30 seconds and cannot save clips. Apply settings to resume the saved trigger. Audio and transcripts are not written to disk.</small></div>
-          <div className="input-with-action"><input aria-label="Voice phrase to test" autoComplete="off" value={voiceTest} onChange={(event) => setVoiceTest(event.target.value)} /><button className="small-button" type="button" onClick={() => void testVoice()}>Test text</button></div>
-          <button className="small-button" type="button" disabled={testingMic || saving || !draft.nativeVoiceAvailable} onClick={() => void testMicrophone()}><Icon name="microphone" size={13} />{testingMic ? 'Updating microphone…' : voice.testMode && voice.listening ? 'Stop microphone test' : 'Test microphone (no saves)'}</button>
-          {voiceResult && <output className="test-result" aria-live="polite">{voiceResult}</output>}
-          <dl><dt>Engine</dt><dd>{voice.engine}</dd><dt>Locale</dt><dd>{voice.locale}</dd><dt>Speech microphone</dt><dd>{voice.microphone}</dd><dt>Input format</dt><dd>{voice.audioFormat || 'Not reported yet'}</dd><dt>Availability / listening</dt><dd>{voice.availability} / {voice.listening ? voice.testMode ? 'testing draft · no saves' : 'listening · saved grammar' : 'stopped'}</dd></dl>
-          {voice.error && <p role="alert">{voice.error}</p>}
-          <div className="voice-observation" aria-live="polite"><span>Last final result</span><strong>{observation?.phrase || 'No recognition result for this session'}</strong>{observation && <small>{observation.confidence === null ? 'Confidence unavailable' : `${Math.round(observation.confidence * 100)}% engine confidence (not an accuracy percentage)`} · wake {observation.decision.wakeMatched ? 'matched' : 'missed'} · command {observation.decision.commandMatched ? 'matched' : 'missed'} · {observation.saved ? 'clip saved' : 'no clip saved'} · {observation.decision.reason}</small>}</div>
+        <div className="voice-lab">
+          <p className="voice-lab-note">Text simulation checks phrase matching only — it does not test microphone accuracy. The microphone test replaces the active voice trigger for up to 30 seconds and cannot save clips; apply settings to resume the saved trigger. Audio and transcripts are not written to disk.</p>
+          <div className="voice-lab-grid">
+            <div className="voice-card">
+              <div className="voice-card-head"><Icon name="keyboard" size={14} /><strong>Test phrase matching</strong><span className="voice-tag">Simulation</span></div>
+              <div className="input-with-action"><input aria-label="Voice phrase to test" autoComplete="off" value={voiceTest} onChange={(event) => setVoiceTest(event.target.value)} /><button className="small-button" type="button" onClick={() => void testVoice()}>Test text</button></div>
+              {phraseError && <p className="voice-alert" role="alert">{phraseError}</p>}
+              {phraseResult ? (
+                <dl className="voice-readout" aria-live="polite">
+                  <dt>Decision</dt><dd><span className={`voice-state ${phraseResult.wouldTrigger ? 'ok' : 'bad'}`}>{phraseResult.wouldTrigger ? 'Would save' : 'Would not save'}</span></dd>
+                  <dt>Wake</dt><dd><span className={`voice-state ${phraseResult.wakeMatched ? 'ok' : 'bad'}`}>{phraseResult.wakeMatched ? 'Matched' : 'Missed'}</span></dd>
+                  <dt>Command</dt><dd>{draft.voiceWakeOnly ? <span className="voice-state">Not required</span> : <span className={`voice-state ${phraseResult.commandMatched ? 'ok' : 'bad'}`}>{phraseResult.commandMatched ? 'Matched' : 'Missed'}</span>}</dd>
+                  <dt>Normalized</dt><dd className="wrap">{phraseResult.normalized || '—'}</dd>
+                  <dt>Reason</dt><dd className="wrap">{phraseResult.reason}</dd>
+                </dl>
+              ) : !phraseError && <p className="voice-idle">Enter a phrase and run the test to see how the matcher would decide. Nothing is recorded and no clips are saved.</p>}
+            </div>
+
+            <div className="voice-card">
+              <div className="voice-card-head"><Icon name="microphone" size={14} /><strong>Test microphone</strong><span className="voice-tag">Live</span></div>
+              <button className="small-button" type="button" disabled={testingMic || saving || !draft.nativeVoiceAvailable} onClick={() => void testMicrophone()}><Icon name="microphone" size={13} />{testingMic ? 'Updating microphone…' : micListening ? 'Stop microphone test' : 'Test microphone (no saves)'}</button>
+              {micError && <p className="voice-alert" role="alert">{micError}</p>}
+              <dl className="voice-readout" aria-live="polite">
+                <dt>State</dt><dd><span className={`voice-state ${micListening ? 'live' : ''}`}>{micState}</span></dd>
+                <dt>Transcript</dt><dd className="wrap">{observation?.phrase || 'Nothing recognized yet'}</dd>
+                <dt>Confidence</dt><dd>{observation ? observation.confidence === null ? 'Not reported by engine' : `${Math.round(observation.confidence * 100)}% engine confidence` : '—'}</dd>
+                <dt>Clips</dt><dd><span className={`voice-state ${observation?.saved ? 'ok' : ''}`}>{observation?.saved ? 'Clip saved' : 'No clips saved'}</span></dd>
+              </dl>
+              {voice.error && <p className="voice-alert" role="alert">{voice.error}</p>}
+              <details className="voice-details">
+                <summary>Engine diagnostics</summary>
+                <dl className="voice-readout">
+                  <dt>Engine</dt><dd className="wrap">{voice.engine}</dd>
+                  <dt>Locale</dt><dd>{voice.locale}</dd>
+                  <dt>Microphone</dt><dd className="wrap">{voice.microphone}</dd>
+                  <dt>Input format</dt><dd className="wrap">{voice.audioFormat || 'Not reported yet'}</dd>
+                  <dt>Availability</dt><dd className="wrap">{voice.availability}</dd>
+                  <dt>Grammar</dt><dd>{voice.listening ? voice.testMode ? 'Draft · no saves' : 'Saved grammar' : 'Stopped'}</dd>
+                  {observation && <><dt>Wake / command</dt><dd>{observation.decision.wakeMatched ? 'matched' : 'missed'} / {observation.decision.commandMatched ? 'matched' : 'missed'}</dd><dt>Last decision</dt><dd className="wrap">{observation.decision.reason}</dd></>}
+                </dl>
+              </details>
+            </div>
+          </div>
         </div>
       </SettingsSection>
 

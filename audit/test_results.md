@@ -81,6 +81,42 @@ would reasonably consider the implementation useful but the full Windows task st
 
 ## Post-change
 
+## UI polish, sidebar layout and Windows startup — 2026-11-06
+
+Environment: Linux aarch64 container, no `DISPLAY`, no GTK/glib dev headers, no Windows host.
+Frontend verification used the Vite production build served over localhost and rendered in the
+cached Playwright Chromium (`chromium-1243`, aarch64) in headless mode. **This is a Chromium
+result, not a WebView2 result**, and it is not a substitute for running the packaged app.
+
+| Check | Result | Actual evidence / boundary |
+|---|---|---|
+| `cargo fmt --all -- --check` | PASS | exit 0 |
+| `cargo check -p courage-core -p courage-store -p courage-cli` | PASS | 15 crates compiled, exit 0 |
+| `cargo clippy -p courage-core -p courage-store -p courage-cli --all-targets -- -D warnings` | PASS | exit 0 |
+| `cargo test -p courage-core -p courage-store -p courage-cli` | PASS | 5 tests passed, 5 suites |
+| `cargo check -p courage-desktop` (host Linux) | **FAIL — pre-existing** | `glib-sys v0.18.1` and `gobject-sys v0.18.0` build scripts fail: `pkg-config --libs --cflags gobject-2.0` exits 1. Missing GTK/glib dev headers, as `CLAUDE.md` documents. Unrelated to this change; no Rust source error was reported. |
+| `cargo check -p courage-desktop --target x86_64-pc-windows-gnu --release` | PASS | 247 crates compiled in 3m20s; compiles `main.rs` with the new attribute plus all `cfg(windows)` modules |
+| `make media-validation` | PASS | `video=h264 audio=aac duration=4.000000s`, `trim_duration=2.000000s`; unchanged from baseline (no media code touched) |
+| `npm --prefix apps/desktop run build` | PASS | `tsc --noEmit` clean; Vite emitted 26.62 kB CSS / 268.80 kB JS |
+| PE subsystem flip from the real `main.rs` source | PASS | `main.rs` compiled standalone for `x86_64-pc-windows-gnu` and linked with `x86_64-w64-mingw32-gcc`; PE optional-header subsystem read directly: debug build `3` (`IMAGE_SUBSYSTEM_WINDOWS_CUI`), release build (`-C debug-assertions=off`) `2` (`IMAGE_SUBSYSTEM_WINDOWS_GUI`). Proves the attribute flips the subsystem and that dev builds keep their console. |
+| Sidebar fixed during content scroll | PASS | Content column scrolled 800px; `.sidebar` moved 0px and `.sidebar-foot` moved 0px; footer bottom remained inside the viewport |
+| Only the intended area scrolls | PASS | Enumerating every element with `scrollHeight > clientHeight` and a scrollable `overflow-y` returned exactly `["workspace-scroll"]`; `documentElement.scrollHeight === clientHeight` (no document scroll, no nested scrollbar) |
+| Shell is viewport-height | PASS | `.app-shell` measured height 760 at a 760px viewport and 640 at a 640px viewport; computed `overflow-y: hidden` |
+| All nav + `Hide to tray` simultaneously visible | PASS | At 1200x760 and at the configured 960x640 minimum: nav labels `["Library","Capture","Settings"]` all within the viewport, `Hide to tray` button present and within the viewport |
+| Non-editable text not selectable | PASS | Computed `user-select`: `h1` = `none`, `.nav-button` = `none` |
+| Settings inputs remain selectable/editable | PASS | Computed `user-select`: `#voice-wake` = `text`, `#capture-fps` = `text` |
+| Stacked layout below 900px | PASS (by design) | At 880px the viewport lock is released and the document scrolls again (`shellHeight` 3006 > viewport 700). `.sidebar-foot` is hidden there by the pre-existing `≤900px` rule; Tauri `minWidth` is 960, so this mode is unreachable in the app window. |
+| Three themes | PASS | Light, Dark and Rusty each rendered the settings view and the new voice panel; semantic status colours resolve from the existing `--good`/`--danger`/`--accent-bright` tokens |
+| Voice panel: text simulation distinct from microphone test | PASS | Two separate cards with separate actions and separate error slots; clicking `Test text` outside Tauri produced the `Run the desktop build to test native recognition.` alert in the simulation card only, leaving the microphone card untouched. The microphone button is correctly disabled when `nativeVoiceAvailable` is false. |
+| Voice panel: diagnostics readable and aligned | PASS | `Engine`, `Locale`, `Microphone`, `Input format`, `Availability`, `Grammar`, wake/command and last decision all render in aligned monospace label/value rows inside the `Engine diagnostics` `<details>`; no UA-default 16px text remains |
+| Packaged NSIS/MSI install and launch on Windows | NOT RUN | No Windows host. This is the only check that can confirm the acceptance criterion "no unwanted terminal window" for the **installed** app end to end. |
+| Real microphone / System.Speech recognition in the new panel | NOT RUN | Requires a Windows recognizer; the panel's live values were observed only in their unavailable/stopped state |
+| WebView2 rendering of the new layout | NOT RUN | Chromium headless is not WebView2; `100dvh`, `color-mix()` and `user-select` should be verified once on a real packaged window |
+
+Behaviour deliberately unchanged: `test_voice_phrase`, `start_voice_test`/`stop_voice_test`, the
+draft-config cleanup effect, and the Rust-side no-save guarantee for microphone tests. The UI only
+reports those; it does not enforce them.
+
 | Command | Result | Evidence |
 |---|---|---|
 | `cargo fmt --all -- --check` | PASS | clean |
