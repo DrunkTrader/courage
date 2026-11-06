@@ -12,3 +12,4 @@ apps/desktop/src-tauri/gen/schemas/windows-schema.json
 !.env.example
 .DS_Store
 Thumbs.db
+/graphify-out/
